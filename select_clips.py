@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import math
 import time
@@ -132,8 +133,35 @@ def _ytdlp_binary() -> list:
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "3600"))
 
 
+# "[download]  42.7% of  118.44MiB at   2.31MiB/s ETA 00:33"
+_DL_PROGRESS = re.compile(
+    r"\[download\]\s+(\d{1,3}(?:\.\d+)?)%\s+of\s+~?\s*([\d.]+\w+)"
+    r"(?:\s+at\s+([\d.]+\w+/s))?(?:\s+ETA\s+([\d:]+))?")
+
+
+def _report_download_line(line: str, progress_callback):
+    """Turn one yt-dlp progress line into a status string for the UI.
+
+    yt-dlp reports 0-100% per FILE, and a merged mp4 is two files (video, then
+    audio), so the bar legitimately runs to 100 twice. The label says which pass is
+    running rather than pretending it is one continuous number, because silently
+    resetting a progress bar to 0 reads as a failure."""
+    if not progress_callback:
+        return
+    m = _DL_PROGRESS.search(line or "")
+    if not m:
+        return
+    pct, total, speed, eta = m.group(1), m.group(2), m.group(3), m.group(4)
+    bits = [f"Downloading {float(pct):.0f}% of {total}"]
+    if speed:
+        bits.append(f"at {speed}")
+    if eta and eta != "Unknown":
+        bits.append(f"ETA {eta}")
+    progress_callback(" ".join(bits), float(pct))
+
+
 def _download_with_ytdlp(url: str, output_path: str, log: DiagnosticLog,
-                         video_quality: str = "best") -> str:
+                         video_quality: str = "best", progress_callback=None) -> str:
     """Download via yt-dlp, escalating through progressively more permissive
     strategies. Each strategy fixes a different real-world failure:
 
@@ -168,11 +196,16 @@ def _download_with_ytdlp(url: str, output_path: str, log: DiagnosticLog,
             "--fragment-retries", "10",
             "--socket-timeout", "30",
             "--merge-output-format", "mp4",
+            # yt-dlp redraws its progress bar with \r, which is invisible to a line
+            # reader. --newline puts each update on its own line; --progress forces
+            # the bar to appear at all when stdout is a pipe rather than a terminal.
+            "--newline", "--progress",
             "-o", output_path,
             url,
         ]
-        result = providers.run_cmd(cmd, timeout=DOWNLOAD_TIMEOUT, retries=1,
-                                   log=log, label="yt-dlp")
+        result = providers.run_cmd_streaming(
+            cmd, timeout=DOWNLOAD_TIMEOUT, log=log, label="yt-dlp",
+            on_line=lambda ln: _report_download_line(ln, progress_callback))
         if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 10_000:
             log.log(f"         Video saved to: {output_path} "
                     f"({os.path.getsize(output_path)//1024} KB) via '{name}'")
@@ -193,12 +226,13 @@ def _download_with_ytdlp(url: str, output_path: str, log: DiagnosticLog,
     )
 
 
-def download_video(url: str, job_dir: str, log: DiagnosticLog, video_quality: str = "best") -> str:
+def download_video(url: str, job_dir: str, log: DiagnosticLog, video_quality: str = "best",
+                   progress_callback=None) -> str:
     video_output_path = os.path.join(job_dir, "raw_video.mp4")
     if "drive.google.com" in url:
         download_from_gdrive(url, video_output_path, log)
     else:
-        _download_with_ytdlp(url, video_output_path, log, video_quality)
+        _download_with_ytdlp(url, video_output_path, log, video_quality, progress_callback)
     return video_output_path
 
 
@@ -605,12 +639,13 @@ def _chunk_segments(segments: list, budget_chars: int) -> list:
     return chunks
 
 
-def _call_selection_llm(client, prompt: str, log: DiagnosticLog):
+def _call_selection_llm(client, prompt: str, log: DiagnosticLog, prefer_model: str = "auto"):
     """Single LLM call with full provider fallback (Groq models -> Gemini).
     Returns parsed list or []."""
     raw = providers.chat(
         prompt, temperature=0.2, json_mode=True, log=log,
         groq_models=[SELECTION_MODEL_PRIMARY, SELECTION_MODEL_FALLBACK],
+        prefer_model=prefer_model,
     )
     if not raw:
         return []
@@ -626,7 +661,8 @@ def _call_selection_llm(client, prompt: str, log: DiagnosticLog):
 def select_highlights_chunked(segments: list, num_clips: int, per_chunk: int,
                               log: DiagnosticLog, clip_prompt: str = "",
                               min_len: float = DEFAULT_MIN_CLIP_LEN,
-                              max_len: float = DEFAULT_MAX_CLIP_LEN) -> list:
+                              max_len: float = DEFAULT_MAX_CLIP_LEN,
+                              prefer_model: str = "auto") -> list:
     """Run the LLM selector across transcript chunks and merge the picks.
 
     `clip_prompt` is the user's free-text description of the clips they want; when
@@ -641,8 +677,8 @@ def select_highlights_chunked(segments: list, num_clips: int, per_chunk: int,
     chunks = _chunk_segments(segments, SELECTION_CHUNK_CHARS)
     brief = _clip_prompt_block(clip_prompt)
     log.log(f"  AI selection: {len(segments)} segments -> {len(chunks)} chunk(s) "
-            f"(model={SELECTION_MODEL_PRIMARY}, ~{SELECTION_CHUNK_CHARS} chars/chunk, "
-            f"{per_chunk} picks/chunk)")
+            f"(model={prefer_model if prefer_model != 'auto' else SELECTION_MODEL_PRIMARY + ' (auto)'}, "
+            f"~{SELECTION_CHUNK_CHARS} chars/chunk, {per_chunk} picks/chunk)")
     if brief:
         log.log(f"  User brief active: {clip_prompt.strip()[:200]}")
 
@@ -660,7 +696,7 @@ Output ONLY valid JSON: {{"highlights": [{{"start": float, "end": float, "score"
 
 TRANSCRIPT PORTION:
 {chunk_text}"""
-        picks = _call_selection_llm(client, prompt, log)
+        picks = _call_selection_llm(client, prompt, log, prefer_model)
         log.log(f"    chunk {ci+1}/{len(chunks)}: {len(picks)} pick(s)")
         all_picks.extend(picks)
 
@@ -899,7 +935,7 @@ def _hook_heuristic(clip_start: float, clip_end: float, segments: list,
 
 
 def _ask_llm_for_hooks(eligible: list, segments: list, hook_len: float,
-                       log: DiagnosticLog) -> dict:
+                       log: DiagnosticLog, prefer_model: str = "auto") -> dict:
     """One call per batch. Returns {clip_id: hook_start_seconds}."""
     picks = {}
     batches = [eligible[i:i + _HOOK_BATCH] for i in range(0, len(eligible), _HOOK_BATCH)]
@@ -940,7 +976,8 @@ Output ONLY valid JSON:
 CLIPS:
 {chr(10).join(blocks)}"""
 
-        raw = providers.chat(prompt, temperature=0.3, json_mode=True, log=log)
+        raw = providers.chat(prompt, temperature=0.3, json_mode=True, log=log,
+                             prefer_model=prefer_model)
         if not raw:
             log.log(f"    hook batch {bi + 1}/{len(batches)}: no reply — using heuristic")
             continue
@@ -971,7 +1008,7 @@ CLIPS:
 
 
 def select_hooks(highlights: list, segments: list, log: DiagnosticLog,
-                 hook_len: float = HOOK_LEN_DEFAULT) -> int:
+                 hook_len: float = HOOK_LEN_DEFAULT, prefer_model: str = "auto") -> int:
     """Choose a `hook_len`-second cold open inside each clip, in place.
 
     Writes `hook_start`, `hook_end` and `hook_text` onto every highlight that gets
@@ -1001,7 +1038,7 @@ def select_hooks(highlights: list, segments: list, log: DiagnosticLog,
     picks = {}
     if segments and providers.provider_status().get("chat_ready"):
         log.log(f"  Asking the AI for the peak moment in {len(eligible)} clip(s)…")
-        picks = _ask_llm_for_hooks(eligible, segments, hook_len, log)
+        picks = _ask_llm_for_hooks(eligible, segments, hook_len, log, prefer_model)
     elif not segments:
         log.log("  No transcript — using the payoff-zone heuristic for every clip.")
     else:
@@ -1128,7 +1165,8 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     clip_prompt = str(options.get("clip_prompt", "") or "").strip()
     raw_picks = select_highlights_chunked(segments, num_clips, per_chunk, log,
                                           clip_prompt=clip_prompt,
-                                          min_len=min_len, max_len=max_len)
+                                          min_len=min_len, max_len=max_len,
+                                          prefer_model=str(options.get("selection_model", "auto")))
 
     for h in raw_picks:
         try:
@@ -1316,7 +1354,15 @@ def execute_selection_workflow(
     options.setdefault("subtitle_language", "hindi")        # "hindi" | "english" | "hinglish"
     options.setdefault("subtitle_position", "bottom")       # "top" | "middle" | "bottom"
     options.setdefault("caption_style", "outline")          # outline|box|white_box|bold_yellow|karaoke|word_pop
-    options.setdefault("caption_accent", "")                # '#RRGGBB' for karaoke/word_pop active word
+    options.setdefault("caption_accent", "")                # '#RRGGBB' highlight for the karaoke/word_pop active word
+    options.setdefault("caption_color", "")                 # '#RRGGBB' caption text colour ('' = the style's own)
+    options.setdefault("caption_words", 0)                  # words on screen at once (1-8; 0 = per-style default)
+    options.setdefault("title_font", "")                    # English-font key for the AI headline ("" = same as captions)
+    options.setdefault("title_style", "")                   # caption-style key for the headline ("" = the original yellow caps)
+    options.setdefault("title_color", "")                   # '#RRGGBB' headline colour ("" = from the style)
+    options.setdefault("aspect", "9:16")                    # 9:16 | 4:5 | 1:1 | 16:9
+    options.setdefault("fit", "fit")                        # fit = letterbox, fill = crop to cover
+    options.setdefault("selection_model", "auto")           # which LLM picks the clips (providers.SELECTION_MODELS)
     options.setdefault("hindi_font", "")                    # noto|mukta|hind|rozha|kalam ('' = auto)
     options.setdefault("english_font", "")                  # poppins|anton|bebas|archivo|fjalla ('' = auto)
     options.setdefault("video_quality", "best")             # best|1080|720|480|360 (link downloads)
@@ -1352,7 +1398,12 @@ def execute_selection_workflow(
         else:
             if status_callback: status_callback("Step 1/4: Downloading video...")
             log.section("STEP 1 - VIDEO DOWNLOAD")
-            video_path = download_video(url, job_dir, log, options.get("video_quality", "best"))
+            # yt-dlp reports per-file percentages; forward them straight to the
+            # same status line the rest of the pipeline writes to.
+            video_path = download_video(
+                url, job_dir, log, options.get("video_quality", "best"),
+                progress_callback=(lambda msg, pct: status_callback(f"Step 1/4: {msg}"))
+                                  if status_callback else None)
 
         # ── SEQUENTIAL MODE ──────────────────────────────────────────────────
         # Splitting the whole video into Part 1 / Part 2 / Part 3 needs no AI and
@@ -1462,7 +1513,8 @@ def execute_selection_workflow(
                 except (OSError, ValueError) as e:
                     log.error(f"Could not re-read transcript for hook selection: {e}")
             hooks_made = select_hooks(highlights, hook_segments, log,
-                                      hook_len=options.get("hook_len", HOOK_LEN_DEFAULT))
+                                      hook_len=options.get("hook_len", HOOK_LEN_DEFAULT),
+                                      prefer_model=str(options.get("selection_model", "auto")))
             with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
                 json.dump(highlights, f, indent=4, ensure_ascii=False)
 
@@ -1504,6 +1556,7 @@ def execute_selection_workflow(
             "hook_first": bool(options.get("hook_first", True)) and not sequential,
             "hook_len": float(options.get("hook_len", HOOK_LEN_DEFAULT)),
             "hooks_made": hooks_made,
+            "selection_model": options.get("selection_model", "auto"),
             # Post-render extras the burn stage runs once all clips are cut.
             "viral_council": bool(options.get("viral_council", True)),
             "publish_kit": bool(options.get("publish_kit", True)),
@@ -1515,6 +1568,13 @@ def execute_selection_workflow(
                 "subtitle_position": options.get("subtitle_position", "bottom"),
                 "caption_style":     options.get("caption_style", "outline"),
                 "caption_accent":    options.get("caption_accent", ""),
+                "caption_color":     options.get("caption_color", ""),
+                "caption_words":     options.get("caption_words", 0),
+                "title_font":        options.get("title_font", ""),
+                "title_style":       options.get("title_style", ""),
+                "title_color":       options.get("title_color", ""),
+                "aspect":            options.get("aspect", "9:16"),
+                "fit":               options.get("fit", "fit"),
                 "hindi_font":        options.get("hindi_font", ""),
                 "english_font":      options.get("english_font", ""),
                 "show_title":        options.get("show_title", False),

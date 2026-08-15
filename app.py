@@ -153,6 +153,10 @@ def api_caption_fonts():
         "hindi": pack(burn_subtitles.available_fonts(burn_subtitles.HINDI_FONTS)),
         "english": pack(burn_subtitles.available_fonts(burn_subtitles.ENGLISH_FONTS)),
         "styles": burn_subtitles.caption_style_catalogue(),
+        # Canvases and the models that can pick clips, so the UI never hardcodes a
+        # list the backend would then reject.
+        "aspects": [{"key": k, "w": w, "h": h} for k, (w, h) in burn_subtitles.ASPECTS.items()],
+        "models": providers.selection_model_catalogue(),
     }
 
 

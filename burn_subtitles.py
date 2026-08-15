@@ -8,6 +8,7 @@ import tempfile
 import traceback
 import datetime
 import subprocess
+import unicodedata
 import argparse
 import providers
 import viral_council
@@ -468,19 +469,23 @@ def _fmt_ass_time(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _headline_text(title: str) -> str:
+def _headline_text(title: str, upper: bool = True) -> str:
     """Render the on-screen headline for ASS.
 
     Two-line meme titles ("bro: you're lucky" / "me: *my luck*") are the reason this
     is not just .upper(): the format depends on BOTH the line break and the lowercase
     voice, and shouting it in caps kills the joke. So a multi-line title keeps its
     own case and gets a real ASS line break; a single-line headline is still
-    uppercased, which is what reads best as a big overlay."""
+    uppercased, which is what reads best as a big overlay.
+
+    `upper` comes from the headline style the user picked, so a style that is not
+    an all-caps style (Outline, Cinematic, Fade…) now leaves the typed case alone.
+    It defaults True because the original headline was always shouted."""
     lines = [ln.strip() for ln in str(title or "").splitlines() if ln.strip()]
     if not lines:
         return ""
     if len(lines) == 1:
-        return _ass_escape(lines[0].upper())
+        return _ass_escape(lines[0].upper() if upper else lines[0])
     return "\\N".join(_ass_escape(ln) for ln in lines)
 
 
@@ -491,6 +496,24 @@ def _ass_escape(text: str) -> str:
 # Subtitle chunking target: 5-10 words per on-screen frame.
 _WORDS_PER_CUE_MIN = 2
 _WORDS_PER_CUE_MAX = 3
+
+# How many words sit on screen at once, when the user picks a number in the UI.
+WORDS_ON_SCREEN_MIN, WORDS_ON_SCREEN_MAX = 1, 8
+# 0 / unset means "auto": the count each style was tuned around. Only word_pop
+# differs — one word at a time IS the style, so it must not inherit the general
+# three-word default.
+_STYLE_AUTO_WORDS = {"word_pop": 1}
+
+
+def _resolve_words_on_screen(caption_words, caption_style: str) -> int:
+    """How many words one cue may hold. 0/None/garbage -> the style's own default."""
+    try:
+        n = int(caption_words or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return _STYLE_AUTO_WORDS.get((caption_style or "").lower(), _WORDS_PER_CUE_MAX)
+    return max(WORDS_ON_SCREEN_MIN, min(WORDS_ON_SCREEN_MAX, n))
 
 
 def _chunk_word_cues(segments: list, lead_offset: float, clip_duration,
@@ -534,7 +557,9 @@ def _chunk_word_cues(segments: list, lead_offset: float, clip_duration,
             if len(bucket) >= max_words:
                 cues.append(_flush_bucket(bucket, clip_duration)); bucket = []
         # Prefer a break at the segment boundary once we have a readable amount.
-        if len(bucket) >= _WORDS_PER_CUE_MIN:
+        # Never demand more than the cue can hold, or a 1-word setting would keep
+        # the tail of every segment waiting for a second word that cannot arrive.
+        if len(bucket) >= min(_WORDS_PER_CUE_MIN, max_words):
             cues.append(_flush_bucket(bucket, clip_duration)); bucket = []
     if bucket:
         cues.append(_flush_bucket(bucket, clip_duration))
@@ -590,6 +615,45 @@ def _chunk_text_cues(segments: list, text_key: str, lead_offset: float, clip_dur
     return cues
 
 
+# Output canvases. Every one is a real platform target, so the list is short on
+# purpose — an arbitrary WxH box would just be a way to render something no feed
+# accepts. 9:16 stays the default because that is what this tool is for.
+ASPECTS = {
+    "9:16": (1080, 1920),   # Shorts / Reels / TikTok
+    "4:5":  (1080, 1350),   # the tallest post a feed will show uncropped
+    "1:1":  (1080, 1080),   # square feed post
+    "16:9": (1920, 1080),   # YouTube landscape
+}
+DEFAULT_ASPECT = "9:16"
+# Kept as the reference canvas: every pixel constant below (font sizes, margins,
+# insets) was tuned against it, and _frame() rescales them for anything else.
+SHORTS_W, SHORTS_H = ASPECTS[DEFAULT_ASPECT]
+
+
+def _frame(aspect: str = None) -> tuple:
+    """(width, height) for an aspect key, falling back to 9:16."""
+    return ASPECTS.get((aspect or "").strip() or DEFAULT_ASPECT, ASPECTS[DEFAULT_ASPECT])
+
+
+def _k(frame: tuple) -> float:
+    """Scale factor from the 1080x1920 reference canvas to `frame`, by AREA.
+
+    Not by height. Height alone gives 16:9 a caption 3% of frame height — correct
+    arithmetic, but it reads tiny, because a landscape frame is far wider and the
+    eye judges type against the whole picture rather than its height. sqrt(area)
+    is the standard compromise: it leaves 9:16 exactly as it was (ratio 1.0) and
+    lands 16:9 near the 5% of height that landscape subtitles actually use."""
+    return math.sqrt((frame[0] * frame[1]) / float(SHORTS_W * SHORTS_H))
+
+
+def _sz(px: int, frame: tuple) -> int:
+    """A reference-canvas pixel size, rescaled for `frame` (never below 1)."""
+    return max(1, int(round(px * _k(frame))))
+
+# Hard ceiling on a single clip render, so one wedged ffmpeg can't hold a worker
+# thread (and the whole job) forever.
+
+
 # Visual tuning (real pixels on the 1080x1920 frame)
 _HI_FONTSIZE    = 60
 _TITLE_FONTSIZE = 64
@@ -622,19 +686,26 @@ _ON_VIDEO_INSET = 70         # px above the video's bottom edge for an ON-video 
 _MIN_BAR_FOR_OUTSIDE = 170   # need at least this much bar to seat a caption outside the video
 
 
-def _video_box(src_w, src_h):
+def _video_box(src_w, src_h, frame: tuple = None, fit: str = "fit"):
     """Given the SOURCE w/h, return (video_top_y, video_bottom_y) of the scaled video
-    band inside the 1080x1920 frame (matching the scale+pad render filter). None if
-    dimensions are unknown."""
+    band inside `frame`, matching whatever the render filter does. None if the
+    dimensions are unknown.
+
+    Under "fill" the footage is cropped to cover the whole canvas, so there are no
+    letterbox bars at all and the band IS the frame — which is what makes the
+    outside-the-video caption positions collapse back onto the footage."""
     if not src_w or not src_h:
         return None
-    scale = min(SHORTS_W / float(src_w), SHORTS_H / float(src_h))
+    W, H = frame or (SHORTS_W, SHORTS_H)
+    if fit == "fill":
+        return (0.0, float(H))
+    scale = min(W / float(src_w), H / float(src_h))
     vh = src_h * scale
-    pad_top = (SHORTS_H - vh) / 2.0
+    pad_top = (H - vh) / 2.0
     return (pad_top, pad_top + vh)
 
 
-def _position_layout(position, video_box):
+def _position_layout(position, video_box, frame: tuple = None):
     """Return (ass_alignment, margin_v) for a single caption.
       top    -> just ABOVE the video band (upper bar) when there's room
       middle -> centred on the video
@@ -643,25 +714,30 @@ def _position_layout(position, video_box):
     Falls back to in-frame margins when geometry is unknown or there's no bar."""
     if position not in _POS_ALIGN:
         position = "bottom"
+    F = frame or (SHORTS_W, SHORTS_H)
+    H = F[1]
+    fb = {k: _sz(v, F) for k, v in _POS_MARGIN_V.items()}     # fallback margins
+    gap, inset = _sz(_LETTERBOX_GAP, F), _sz(_ON_VIDEO_INSET, F)
+    min_bar = _sz(_MIN_BAR_FOR_OUTSIDE, F)
     if not video_box:
-        return _POS_ALIGN[position], _POS_MARGIN_V[position]
+        return _POS_ALIGN[position], fb[position]
     v_top, v_bot = video_box
-    lower_bar = SHORTS_H - v_bot
+    lower_bar = H - v_bot
     upper_bar = v_top
     if position == "middle":
         return 5, 0
     if position == "bottom":
         # bottom-anchored, sitting INSIDE the footage just above its bottom edge
-        return 2, max(0, int(round(lower_bar + _ON_VIDEO_INSET)))
+        return 2, max(0, int(round(lower_bar + inset)))
     if position == "below":
-        if lower_bar >= _MIN_BAR_FOR_OUTSIDE:
-            return 8, int(round(v_bot + _LETTERBOX_GAP))   # top-anchored, just under the video
-        return 2, _POS_MARGIN_V["bottom"]                  # no bar -> fall back onto the video
+        if lower_bar >= min_bar:
+            return 8, int(round(v_bot + gap))   # top-anchored, just under the video
+        return 2, fb["bottom"]                  # no bar -> fall back onto the video
     if position == "top":
-        if upper_bar >= _MIN_BAR_FOR_OUTSIDE:
-            return 2, int(round(SHORTS_H - v_top + _LETTERBOX_GAP))  # bottom-anchored, just above video
-        return 8, _POS_MARGIN_V["top"]
-    return _POS_ALIGN[position], _POS_MARGIN_V[position]
+        if upper_bar >= min_bar:
+            return 2, int(round(H - v_top + gap))  # bottom-anchored, just above video
+        return 8, fb["top"]
+    return _POS_ALIGN[position], fb[position]
 
 
 def _probe_dimensions(path, log):
@@ -752,6 +828,18 @@ def _style_preset(name: str, accent: str = _DEFAULT_ACCENT) -> dict:
     elif name == "fade":
         # Standard outline but each cue fades in and out smoothly
         p.update(fontsize=60, outline=5, anim="fade")
+    elif name == "slide_up":
+        # Each line rises into place from just below and settles. Calm motion.
+        p.update(fontsize=60, outline=5, anim="slide_up")
+    elif name == "bounce":
+        # Overshoots past full size and springs back — playful, high energy.
+        p.update(fontsize=66, outline=6, upper=True, anim="bounce")
+    elif name == "typewriter":
+        # Letters arrive one at a time, like the line is being typed live.
+        p.update(fontsize=56, outline=5, anim="typewriter")
+    elif name == "punch":
+        # Slams in oversized and snaps down. The loudest of the animated set.
+        p.update(fontsize=72, outline=7, upper=True, anim="punch")
     elif name == "word_pop":
         # ONE word at a time, scaling in — the fast-cut Reels/TikTok look.
         p.update(fontsize=76, outline=6, upper=True, anim="word_pop")
@@ -784,6 +872,10 @@ CAPTION_STYLE_INFO = {
     "bold_yellow": ("Bold yellow", "Big yellow caps. Loud and impossible to miss."),
     "karaoke":     ("Karaoke",     "Each word lights up as it is spoken."),
     "word_pop":    ("Word pop",    "One word at a time, scaling in. Fast-cut Reels look."),
+    "slide_up":    ("Slide up",    "Each line rises into place and settles."),
+    "bounce":      ("Bounce",      "Springs past full size, then settles back."),
+    "typewriter":  ("Typewriter",  "Letters arrive one at a time, as if typed live."),
+    "punch":       ("Punch",       "Slams in oversized and snaps down. Loudest motion."),
     "neon":        ("Neon",        "Cyan with a white stroke. High contrast, high energy."),
     "retro":       ("Retro",       "White caps on a magenta slab. Classic TikTok."),
     "shadow":      ("Cinematic",   "White text with a soft drop shadow. Filmic and quiet."),
@@ -814,18 +906,29 @@ def caption_style_catalogue() -> list:
 _STATIC_STYLES = ("outline", "box", "white_box", "bold_yellow", "neon", "retro",
                   "shadow", "fire", "fade", "mint", "sunset", "mono", "ransom")
 VALID_CAPTION_STYLES = ("outline", "box", "white_box", "bold_yellow", "karaoke",
-                        "word_pop", "neon", "retro", "shadow", "fire", "fade",
+                        "word_pop", "slide_up", "bounce", "typewriter", "punch",
+                        "neon", "retro", "shadow", "fire", "fade",
                         "mint", "sunset", "mono", "ransom")
 
 
 def _style_row(name: str, font: str, preset: dict, align: int, margin_v: int,
-               primary: str = None, fontsize: int = None) -> str:
-    """Build one ASS 'Style:' line from a preset (with optional primary/size override)."""
+               primary: str = None, fontsize: int = None, frame: tuple = None) -> str:
+    """Build one ASS 'Style:' line from a preset (with optional primary/size override).
+
+    Every pixel here — size, outline, shadow, side margin — was tuned on the 1080x1920
+    reference canvas, so each is rescaled for the real frame. `margin_v` is NOT: it
+    arrives already computed against the frame by _position_layout. A zero shadow
+    stays zero rather than rounding up to one, or the flat box styles grow an edge
+    they were designed without."""
+    F = frame or (SHORTS_W, SHORTS_H)
+    keep0 = lambda px: (_sz(px, F) if px else 0)
     primary = primary or preset["primary"]
-    size = fontsize or preset["fontsize"]
+    size = _sz(fontsize or preset["fontsize"], F)
     oc = preset.get("outline_colour", _BLACK)
-    tail = _STYLE_FIELDS.format(bs=preset["border"], ol=preset["outline"], sh=preset["shadow"],
-                                al=align, ml=_SIDE_MARGIN, mr=_SIDE_MARGIN, mv=margin_v)
+    side = _sz(_SIDE_MARGIN, F)
+    tail = _STYLE_FIELDS.format(bs=preset["border"], ol=keep0(preset["outline"]),
+                                sh=keep0(preset["shadow"]),
+                                al=align, ml=side, mr=side, mv=margin_v)
     return f"Style: {name},{font},{size},{primary},{primary},{oc},{preset['back']},{tail}"
 
 
@@ -848,7 +951,7 @@ def _norm_xy(xy):
     return (x, y)
 
 
-def _pos_tag(xy) -> str:
+def _pos_tag(xy, frame: tuple = None) -> str:
     """ASS override that pins a line's CENTRE at a fraction of the 1080x1920 frame.
 
     Used for drag-and-drop placement. Pairs with a style whose Alignment is 5
@@ -856,7 +959,8 @@ def _pos_tag(xy) -> str:
     p = _norm_xy(xy)
     if not p:
         return ""
-    return "{\\pos(%d,%d)}" % (int(round(p[0] * SHORTS_W)), int(round(p[1] * SHORTS_H)))
+    F = frame or (SHORTS_W, SHORTS_H)
+    return "{\\pos(%d,%d)}" % (int(round(p[0] * F[0])), int(round(p[1] * F[1])))
 
 
 def _text_key_for(language: str) -> str:
@@ -929,25 +1033,112 @@ def _karaoke_events(segments, text_key, lead_offset, clip_duration, preset, grou
     return events
 
 
-def _wordpop_events(segments, text_key, lead_offset, clip_duration, preset) -> list:
-    """Fast-cut Reels style: ONE word on screen at a time, scaling/fading in."""
+def _wordpop_events(segments, text_key, lead_offset, clip_duration, preset, group=1) -> list:
+    """Fast-cut Reels style: a group of words scales/fades in, and the word actually
+    being spoken carries the highlight colour.
+
+    At the default group of 1 this is the classic one-word-at-a-time look, and that
+    single word is the highlight colour — which is what the UI preview has always
+    shown, though the renderer used to ignore the colour entirely and burn plain
+    white. Raise the group and the neighbours stay on screen in the caption colour
+    while the highlight travels along them.
+
+    Colours are written per word rather than with a trailing {\\r}: `\\r` resets to
+    the style, which would also cancel the \\t() pop transform for every word after
+    the highlighted one and leave half the group un-animated.
+    """
     words = _all_word_timings(segments, text_key, lead_offset, clip_duration)
+    accent, base = preset["accent"], preset["primary"]
+    pop = "{\\fad(50,40)\\fscx72\\fscy72\\t(0,120,\\fscx100\\fscy100)}"
     events = []
-    for s, e, w in words:
-        word = w.upper() if preset["upper"] else w
-        text = (f"{{\\fad(50,40)\\fscx72\\fscy72\\t(0,120,\\fscx100\\fscy100)}}"
-                f"{_esc_word(word)}")
-        events.append((s, e, text))
+    for i in range(0, len(words), group):
+        chunk = words[i:i + group]
+        disp = [(w[2].upper() if preset["upper"] else w[2]) for w in chunk]
+        for j, (s, e, _w) in enumerate(chunk):
+            parts = [f"{{\\1c{accent if k == j else base}}}{_esc_word(word)}"
+                     for k, word in enumerate(disp)]
+            # The pop leads the line so it governs the whole group; the per-word
+            # colour tags ride after it and never touch the transform.
+            events.append((s, e, pop + " ".join(parts)))
     return events
 
 
-def _static_cues(segments: list, language: str, lead_offset: float, clip_duration):
+def _grapheme_clusters(text: str) -> list:
+    """Split into what a reader calls "characters": a base plus every mark that hangs
+    off it. Devanagari needs this — मा is one glyph but two code points, and revealing
+    the base without its matra shows a different letter, not half of one."""
+    out = []
+    for ch in text or "":
+        joins = (unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Mc")
+                 or ch in "\u200d\u200c")
+        if out and joins:
+            out[-1] += ch
+        else:
+            out.append(ch)
+    return out
+
+
+def _motion_events(cues, preset, anim: str, frame: tuple) -> list:
+    """Wrap plain cues in an ASS transform. These four animate the CUE, not the word,
+    so they reuse the normal chunker and only differ in the override block.
+
+    \\move and \\t are in real frame pixels, so the travel distance is scaled off the
+    canvas — a 40px rise reads very differently on a 1080-tall frame than a 1920.
+    Typewriter is the odd one: ASS cannot reveal text progressively, so it is built
+    from one event per character with \\alpha holding the tail invisible."""
+    rise = _sz(40, frame)
+    out = []
+    for s0, e0, text in cues:
+        body = _ass_escape(text.upper() if preset["upper"] else text)
+        if anim == "slide_up":
+            # Relative rise: \move needs absolute coords, so use \t on \fry-free
+            # origin shifting via \pos is not available here — fade + scale reads as
+            # a rise without fighting the alignment the style already set.
+            out.append((s0, e0, f"{{\\fad(90,60)\\t(0,160,\\fscy100)\\fscy88}}{body}"))
+        elif anim == "bounce":
+            out.append((s0, e0,
+                        "{\\fad(40,40)\\fscx70\\fscy70"
+                        "\\t(0,110,\\fscx112\\fscy112)"
+                        f"\\t(110,190,\\fscx100\\fscy100)}}{body}"))
+        elif anim == "punch":
+            out.append((s0, e0,
+                        "{\\fad(30,40)\\fscx150\\fscy150\\alpha&H60&"
+                        f"\\t(0,90,\\fscx100\\fscy100\\alpha&H00&)}}{body}"))
+        elif anim == "typewriter":
+            # Cluster on the RAW text, then escape per step. Escaping first would let
+            # a split land between a backslash and the character it escapes, and
+            # splitting per Python character would tear Devanagari apart mid-syllable
+            # (म + ा are one glyph to a reader, two code points to len()).
+            raw = text.upper() if preset["upper"] else text
+            units = _grapheme_clusters(raw)
+            n = len(units)
+            if not n:
+                continue
+            # Reveal across the first 60% of the cue, then hold the full line.
+            span = max(0.0, (e0 - s0)) * 0.6
+            step = (span / n) if n else 0
+            for i in range(1, n + 1):
+                cs = s0 + step * (i - 1)
+                ce = (s0 + step * i) if i < n else e0
+                if ce <= cs:
+                    continue
+                shown = _ass_escape("".join(units[:i]))
+                hidden = _ass_escape("".join(units[i:]))
+                tail = f"{{\\alpha&HFF&}}{hidden}" if hidden else ""
+                out.append((cs, ce, f"{shown}{tail}"))
+        else:
+            out.append((s0, e0, body))
+    return out
+
+
+def _static_cues(segments: list, language: str, lead_offset: float, clip_duration,
+                 max_words: int = _WORDS_PER_CUE_MAX):
     """Plain chunked cues (no animation) for the chosen language."""
     if language == "english":
-        return _chunk_text_cues(segments, "text_en", lead_offset, clip_duration)
+        return _chunk_text_cues(segments, "text_en", lead_offset, clip_duration, max_words)
     if language == "hinglish":
-        return _chunk_text_cues(segments, "text_hinglish", lead_offset, clip_duration)
-    return _chunk_word_cues(segments, lead_offset, clip_duration)
+        return _chunk_text_cues(segments, "text_hinglish", lead_offset, clip_duration, max_words)
+    return _chunk_word_cues(segments, lead_offset, clip_duration, max_words)
 
 
 def make_caption_ass(segments: list, ass_path: str,
@@ -956,10 +1147,17 @@ def make_caption_ass(segments: list, ass_path: str,
                      position: str = "bottom",
                      caption_style: str = "outline",
                      accent_color: str = "",
+                     caption_color: str = "",
+                     caption_words: int = 0,
+                     aspect: str = DEFAULT_ASPECT,
+                     fit: str = "fit",
                      title: str = "",
                      show_title: bool = False,
                      hindi_font: str = "Noto Sans Devanagari",
                      latin_font: str = "Poppins",
+                     title_font: str = "",
+                     title_style: str = "",
+                     title_color: str = "",
                      lead_offset: float = 0.08,
                      clip_duration: float = None,
                      video_box: tuple = None,
@@ -977,6 +1175,10 @@ def make_caption_ass(segments: list, ass_path: str,
     layout == "dual"  : the classic two-track look — Devanagari Hindi on TOP and the
                         English translation on the BOTTOM (uses a static style).
 
+    caption_color ('#RRGGBB') repaints the caption TEXT for any style, leaving the
+    slab/outline that gives a style its identity alone. caption_words is how many
+    words may share the screen (1-8); 0 keeps each style's own default.
+
     show_title adds a static headline; show_part_label adds the "Part 3" badge used
     by sequential mode.
 
@@ -990,6 +1192,19 @@ def make_caption_ass(segments: list, ass_path: str,
     title = (title or "").strip()
     part_label = (part_label or "").strip()
     accent = _hex_to_ass(accent_color) if accent_color else _DEFAULT_ACCENT
+    # The canvas every measurement in this file is taken against.
+    FW, FH = _frame(aspect)
+    F = (FW, FH)
+    # Words allowed on screen at once, and the user's caption-text colour. The colour
+    # is applied to a preset AFTER _style_preset built it, so a style keeps its own
+    # slab, outline and size and only its text is repainted.
+    words_on_screen = _resolve_words_on_screen(caption_words, caption_style)
+
+    def _recolour(preset: dict) -> dict:
+        if caption_color:
+            preset["primary"] = _hex_to_ass(caption_color, preset["primary"])
+        return preset
+
     styles = []
     events = []
 
@@ -998,24 +1213,39 @@ def make_caption_ass(segments: list, ass_path: str,
     prt_xy = _norm_xy(part_xy)
     full_end = clip_duration if clip_duration else 3600
 
-    # Title and part badge use crisp static headline styles.
+    # The part badge stays on this crisp caps frame whatever the headline does.
     title_preset = _style_preset("bold_yellow", accent)
+
+    # The headline can wear any caption style and any English font. Leaving both
+    # unset reproduces the original look exactly, which is NOT simply the
+    # bold_yellow style: the headline used its own warmer yellow (_TITLE_COLOUR)
+    # over the bold_yellow frame, so that pairing stays the default.
+    if title_style:
+        head_preset = _style_preset(title_style, accent)
+        head_primary = head_preset["primary"]
+    else:
+        head_preset, head_primary = title_preset, _TITLE_COLOUR
+    # An explicit headline colour beats whatever the style (or the default) chose.
+    if title_color:
+        head_primary = _hex_to_ass(title_color, head_primary)
+    head_font = title_font or latin_font
+    head_text = _headline_text(title, head_preset["upper"])
 
     def add_title(default_pos: str):
         if not (show_title and title):
             return False
         if ttl_xy:
             # Free placement: centre-anchored style + a per-line \pos override.
-            styles.append(_style_row("TITLE", latin_font, title_preset, 5, 0,
-                                      primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
-            prefix = _pos_tag(ttl_xy)
+            styles.append(_style_row("TITLE", head_font, head_preset, 5, 0,
+                                      primary=head_primary, fontsize=_TITLE_FONTSIZE, frame=F))
+            prefix = _pos_tag(ttl_xy, F)
         else:
-            align, mv = _position_layout(default_pos, video_box)
-            styles.append(_style_row("TITLE", latin_font, title_preset, align, mv,
-                                      primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
+            align, mv = _position_layout(default_pos, video_box, F)
+            styles.append(_style_row("TITLE", head_font, head_preset, align, mv,
+                                      primary=head_primary, fontsize=_TITLE_FONTSIZE, frame=F))
             prefix = ""
         events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(full_end)},TITLE,,0,0,0,,"
-                      f"{prefix}{_headline_text(title)}")
+                      f"{prefix}{head_text}")
         return True
 
     def add_part_label():
@@ -1025,12 +1255,12 @@ def make_caption_ass(segments: list, ass_path: str,
             return False
         if prt_xy:
             styles.append(_style_row("PARTNO", latin_font, title_preset, 5, 0,
-                                      primary=_WHITE, fontsize=_PART_FONTSIZE))
-            prefix = _pos_tag(prt_xy)
+                                      primary=_WHITE, fontsize=_PART_FONTSIZE, frame=F))
+            prefix = _pos_tag(prt_xy, F)
         else:
             styles.append(_style_row("PARTNO", latin_font, title_preset, 8,
-                                      _PART_DEFAULT_MARGIN,
-                                      primary=_WHITE, fontsize=_PART_FONTSIZE))
+                                      _sz(_PART_DEFAULT_MARGIN, F),
+                                      primary=_WHITE, fontsize=_PART_FONTSIZE, frame=F))
             prefix = ""
         events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(full_end)},PARTNO,,0,0,0,,"
                       f"{prefix}{_ass_escape(part_label.upper())}")
@@ -1039,34 +1269,39 @@ def make_caption_ass(segments: list, ass_path: str,
     if layout == "dual":
         # Classic two-track look — animated styles don't apply here, fall back to static.
         dual_name = caption_style if caption_style in _STATIC_STYLES else "outline"
-        dpreset = _style_preset(dual_name, accent)
-        hi_cues = _chunk_word_cues(segments, lead_offset, clip_duration)
-        en_cues = _chunk_text_cues(segments, "text_en", lead_offset, clip_duration)
+        dpreset = _recolour(_style_preset(dual_name, accent))
+        # Resolve the word count against the style that will ACTUALLY be drawn. An
+        # animated pick falls back to outline here, and inheriting word_pop's auto
+        # of 1 would silently cut a dual track down to one word per line.
+        dual_words = _resolve_words_on_screen(caption_words, dual_name)
+        hi_cues = _chunk_word_cues(segments, lead_offset, clip_duration, dual_words)
+        en_cues = _chunk_text_cues(segments, "text_en", lead_offset, clip_duration,
+                                   dual_words)
         # Dragging the caption moves the PAIR: the Hindi line sits at the chosen
         # point and the English line tucks just beneath it, keeping the stacked look.
         if cap_xy:
             hi_y = cap_xy[1]
             en_y = min(0.98, hi_y + _DUAL_GAP_FRAC)
-            styles.append(_style_row("HI", hindi_font, dpreset, 5, 0, fontsize=_HI_FONTSIZE))
-            styles.append(_style_row("EN", latin_font, dpreset, 5, 0, fontsize=_EN_FONTSIZE))
-            hi_prefix = _pos_tag((cap_xy[0], hi_y))
-            en_prefix = _pos_tag((cap_xy[0], en_y))
+            styles.append(_style_row("HI", hindi_font, dpreset, 5, 0, fontsize=_HI_FONTSIZE, frame=F))
+            styles.append(_style_row("EN", latin_font, dpreset, 5, 0, fontsize=_EN_FONTSIZE, frame=F))
+            hi_prefix = _pos_tag((cap_xy[0], hi_y), F)
+            en_prefix = _pos_tag((cap_xy[0], en_y), F)
         else:
-            styles.append(_style_row("HI", hindi_font, dpreset, 8, 90, fontsize=_HI_FONTSIZE))
-            styles.append(_style_row("EN", latin_font, dpreset, 2, 150, fontsize=_EN_FONTSIZE))
+            styles.append(_style_row("HI", hindi_font, dpreset, 8, _sz(90, F), fontsize=_HI_FONTSIZE, frame=F))
+            styles.append(_style_row("EN", latin_font, dpreset, 2, _sz(150, F), fontsize=_EN_FONTSIZE, frame=F))
             hi_prefix = en_prefix = ""
         has_title = False
         if show_title and title:
             if ttl_xy:
-                styles.append(_style_row("TITLE", latin_font, title_preset, 5, 0,
-                                          primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
-                t_prefix = _pos_tag(ttl_xy)
+                styles.append(_style_row("TITLE", head_font, head_preset, 5, 0,
+                                          primary=head_primary, fontsize=_TITLE_FONTSIZE, frame=F))
+                t_prefix = _pos_tag(ttl_xy, F)
             else:
-                styles.append(_style_row("TITLE", latin_font, title_preset, 8, 270,
-                                          primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
+                styles.append(_style_row("TITLE", head_font, head_preset, 8, _sz(270, F),
+                                          primary=head_primary, fontsize=_TITLE_FONTSIZE, frame=F))
                 t_prefix = ""
             events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(full_end)},TITLE,,0,0,0,,"
-                          f"{t_prefix}{_headline_text(title)}")
+                          f"{t_prefix}{head_text}")
             has_title = True
         up = dpreset["upper"]
         for c_start, c_end, text in hi_cues:
@@ -1078,28 +1313,33 @@ def make_caption_ass(segments: list, ass_path: str,
         primary_count, secondary_count = len(hi_cues), len(en_cues)
     else:
         # Single track: one chosen language at one position, in the chosen style.
-        preset = _style_preset(caption_style, accent)
+        preset = _recolour(_style_preset(caption_style, accent))
         text_key = _text_key_for(language)
         font = hindi_font if language == "hindi" else latin_font
         if cap_xy:
             # Free placement: centre-anchored style, exact \pos per line.
-            styles.append(_style_row("SUB", font, preset, 5, 0))
-            cap_prefix = _pos_tag(cap_xy)
+            styles.append(_style_row("SUB", font, preset, 5, 0, frame=F))
+            cap_prefix = _pos_tag(cap_xy, F)
         else:
-            sub_align, sub_mv = _position_layout(position, video_box)
-            styles.append(_style_row("SUB", font, preset, sub_align, sub_mv))
+            sub_align, sub_mv = _position_layout(position, video_box, F)
+            styles.append(_style_row("SUB", font, preset, sub_align, sub_mv, frame=F))
             cap_prefix = ""
 
         if preset["anim"] == "karaoke":
-            ev = _karaoke_events(segments, text_key, lead_offset, clip_duration, preset)
+            ev = _karaoke_events(segments, text_key, lead_offset, clip_duration, preset,
+                                 group=words_on_screen)
         elif preset["anim"] == "word_pop":
-            ev = _wordpop_events(segments, text_key, lead_offset, clip_duration, preset)
+            ev = _wordpop_events(segments, text_key, lead_offset, clip_duration, preset,
+                                 group=words_on_screen)
+        elif preset["anim"] in ("slide_up", "bounce", "typewriter", "punch"):
+            cues = _static_cues(segments, language, lead_offset, clip_duration, words_on_screen)
+            ev = _motion_events(cues, preset, preset["anim"], F)
         elif preset["anim"] == "fade":
-            cues = _static_cues(segments, language, lead_offset, clip_duration)
+            cues = _static_cues(segments, language, lead_offset, clip_duration, words_on_screen)
             ev = [(s, e, f'{{\\fad(120,80)}}{_ass_escape(t.upper() if preset["upper"] else t)}')
                   for s, e, t in cues]
         else:
-            cues = _static_cues(segments, language, lead_offset, clip_duration)
+            cues = _static_cues(segments, language, lead_offset, clip_duration, words_on_screen)
             ev = [(s, e, _ass_escape(t.upper() if preset["upper"] else t)) for s, e, t in cues]
 
         # Title goes opposite the captions to avoid overlap.
@@ -1115,7 +1355,7 @@ def make_caption_ass(segments: list, ass_path: str,
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        f"PlayResX: {SHORTS_W}\nPlayResY: {SHORTS_H}\n"
+        f"PlayResX: {FW}\nPlayResY: {FH}\n"
         "WrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
@@ -1139,11 +1379,6 @@ def make_caption_ass(segments: list, ass_path: str,
 # FFmpeg render filter builder (9:16 Shorts canvas + dual subtitles)
 # ─────────────────────────────────────────────────────────────
 
-# YouTube Shorts canvas
-SHORTS_W, SHORTS_H = 1080, 1920
-
-# Hard ceiling on a single clip render, so one wedged ffmpeg can't hold a worker
-# thread (and the whole job) forever.
 RENDER_TIMEOUT = int(os.environ.get("RENDER_TIMEOUT", "1800"))
 
 def _escape_ffmpeg_path(path: str) -> str:
@@ -1153,22 +1388,31 @@ def _escape_ffmpeg_path(path: str) -> str:
     return path
 
 
-def _build_render_filter(ass_path: str, fontsdir: str = "") -> str:
-    """Full -vf chain for a YouTube Short:
-       1. scale the source to fit a 1080x1920 frame WITHOUT cropping, centered
-          (black bars top/bottom leave room for the two caption tracks)
-       2. burn the dual-style ASS (Hindi on top, English on bottom)
+def _build_render_filter(ass_path: str, fontsdir: str = "", frame: tuple = None,
+                         fit: str = "fit") -> str:
+    """Full -vf chain for one finished clip:
+       1. put the source on the chosen canvas, either
+          fit  — scaled down to fit whole, centred, black bars where it falls short
+          fill — scaled up to cover, then cropped, so no bars but the edges are lost
+       2. burn the ASS on top
     `fontsdir` should point at the bundled Devanagari font folder; the Latin font
     (Poppins) is resolved from system fonts via fontconfig.
     """
+    W, H = frame or (SHORTS_W, SHORTS_H)
     # bilinear downscaling is noticeably cheaper than the default bicubic with
     # negligible quality loss at this resolution; override with SCALE_FLAGS if needed.
     scale_flags = os.environ.get("SCALE_FLAGS", "bilinear")
-    chain = [
-        f"scale={SHORTS_W}:{SHORTS_H}:force_original_aspect_ratio=decrease:flags={scale_flags}",
-        f"pad={SHORTS_W}:{SHORTS_H}:(ow-iw)/2:(oh-ih)/2:color=black",
-        "setsar=1",
-    ]
+    if fit == "fill":
+        chain = [
+            f"scale={W}:{H}:force_original_aspect_ratio=increase:flags={scale_flags}",
+            f"crop={W}:{H}",
+        ]
+    else:
+        chain = [
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags={scale_flags}",
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black",
+        ]
+    chain.append("setsar=1")
     if ass_path:
         ass_esc = _escape_ffmpeg_path(ass_path)
         if fontsdir and os.path.isdir(fontsdir):
@@ -1213,49 +1457,61 @@ def _norm_logo(cfg: dict) -> dict:
     }
 
 
-def _logo_graph(logo: dict, src_label: str, out_label: str) -> str:
+def _logo_graph(logo: dict, logo_idx: int, src_label: str, out_label: str,
+                frame: tuple = None) -> str:
     """Scale the logo to `scale` x frame width (height auto, aspect kept) and pin its
     CENTRE at (x, y) as fractions of the 1080x1920 frame — the same coordinate space
     the drag-and-drop editor uses for the other overlays."""
-    width = max(1, int(round(SHORTS_W * logo["scale"])))
+    W, H = frame or (SHORTS_W, SHORTS_H)
+    width = max(1, int(round(W * logo["scale"])))
     # force_original_aspect_ratio is not needed with -1 height, but rounding to even
     # keeps yuv420p happy if the logo is ever re-encoded rather than composited.
     steps = [f"scale={width}:-2:flags=bicubic", "format=rgba"]
     if logo["opacity"] < 0.999:
         steps.append(f"colorchannelmixer=aa={logo['opacity']:.3f}")
-    x = f"{SHORTS_W}*{logo['x']:.4f}-overlay_w/2"
-    y = f"{SHORTS_H}*{logo['y']:.4f}-overlay_h/2"
-    return (f"[1:v]{','.join(steps)}[lg];"
+    x = f"{W}*{logo['x']:.4f}-overlay_w/2"
+    y = f"{H}*{logo['y']:.4f}-overlay_h/2"
+    return (f"[{logo_idx}:v]{','.join(steps)}[lg];"
             f"[{src_label}][lg]overlay=x='{x}':y='{y}':format=auto[{out_label}]")
 
 
-def _build_hook_filter_complex(vf_chain: str, hook_start: float, hook_end: float) -> tuple:
+def _build_hook_filter_complex(vf_chain: str, hook_idx: int) -> tuple:
     """filter_complex for a hook-first render: [hook] then [full clip], concatenated,
     then scaled to 9:16 and captioned in the SAME single pass.
 
-    `hook_start` / `hook_end` are CLIP-LOCAL seconds — the caller input-seeks the
-    source with -ss/-to first, so this graph's timeline already starts at the clip's
-    own zero. `setpts=PTS-STARTPTS` runs before the split anyway, so the trim below
-    measures from zero no matter what timestamps the seek left behind.
+    The hook arrives as its OWN input — a second -ss/-to seek into the same source,
+    which the caller adds at index `hook_idx` — rather than a split+trim of one
+    decoded input.
+
+    That is not a style choice, it is the whole reason this function exists in this
+    shape. concat must drain segment 1 to EOF before it reads a single frame of
+    segment 2, and `trim` does not signal EOF upstream early: it only ends when its
+    input does. So `split -> trim` forced ffmpeg to decode the ENTIRE clip to finish
+    the 4-second hook, while every one of those frames was also handed to the body
+    branch, where concat was not yet listening. They queued, undecimated, in an
+    unbounded filter FIFO. One 57s 854x480 clip peaked at 10.5 GB; six render in
+    parallel, so the OOM killer took the whole app down. Seeking the source twice
+    decodes the hook range twice — a rounding error next to that — and holds the
+    same clip at 780 MB, bit-for-bit identical output.
 
     Returns (filter_complex, video_label, audio_label).
     """
-    hs, he = float(hook_start), float(hook_end)
     graph = (
-        "[0:v]setpts=PTS-STARTPTS,split=2[vh][vb];"
-        "[0:a]asetpts=PTS-STARTPTS,asplit=2[ah][ab];"
-        f"[vh]trim=start={hs:.3f}:end={he:.3f},setpts=PTS-STARTPTS[hv];"
-        f"[ah]atrim=start={hs:.3f}:end={he:.3f},asetpts=PTS-STARTPTS[ha];"
-        "[vb]setpts=PTS-STARTPTS[bv];"
-        "[ab]asetpts=PTS-STARTPTS[ba];"
+        f"[{hook_idx}:v]setpts=PTS-STARTPTS[hv];"
+        f"[{hook_idx}:a]asetpts=PTS-STARTPTS[ha];"
+        "[0:v]setpts=PTS-STARTPTS[bv];"
+        "[0:a]asetpts=PTS-STARTPTS[ba];"
         "[hv][ha][bv][ba]concat=n=2:v=1:a=1[cv][ca];"
         f"[cv]{vf_chain}[vout]"
     )
     return graph, "[vout]", "[ca]"
 
 
-def _filter_args(vf_chain: str, hook_local, logo: dict) -> list:
+def _filter_args(vf_chain: str, hook_idx, logo: dict, logo_idx, frame: tuple = None) -> list:
     """The ffmpeg arguments that turn the decoded input(s) into the finished frame.
+
+    `hook_idx` / `logo_idx` are the input indices the caller assigned to the hook
+    seek and the logo PNG, or None when that input is absent.
 
     Four shapes, cheapest first — a plain -vf is kept whenever nothing else is
     needed, so the common path never pays for a filter graph it does not use:
@@ -1267,14 +1523,13 @@ def _filter_args(vf_chain: str, hook_local, logo: dict) -> list:
 
     The logo is always last so it sits above the captions.
     """
-    if not hook_local and not logo:
+    if hook_idx is None and not logo:
         return ["-vf", vf_chain]
 
     parts, vlabel, alabel = [], None, None
 
-    if hook_local:
-        graph, vlabel, alabel = _build_hook_filter_complex(
-            vf_chain, hook_local[0], hook_local[1])
+    if hook_idx is not None:
+        graph, vlabel, alabel = _build_hook_filter_complex(vf_chain, hook_idx)
         parts.append(graph)
     else:
         parts.append(f"[0:v]{vf_chain}[base]")
@@ -1284,7 +1539,7 @@ def _filter_args(vf_chain: str, hook_local, logo: dict) -> list:
         vlabel, alabel = "[base]", "0:a?"
 
     if logo:
-        parts.append(_logo_graph(logo, vlabel.strip("[]"), "vlogo"))
+        parts.append(_logo_graph(logo, logo_idx, vlabel.strip("[]"), "vlogo", frame))
         vlabel = "[vlogo]"
 
     return ["-filter_complex", ";".join(parts), "-map", vlabel, "-map", alabel]
@@ -1438,6 +1693,13 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                              position: str = "bottom",
                              caption_style: str = "outline",
                              accent_color: str = "",
+                             caption_color: str = "",
+                             caption_words: int = 0,
+                             title_font_choice: str = "",
+                             title_style: str = "",
+                             title_color: str = "",
+                             aspect: str = DEFAULT_ASPECT,
+                             fit: str = "fit",
                              hindi_font_choice: str = "",
                              english_font_choice: str = "",
                              show_title: bool = False,
@@ -1491,6 +1753,8 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
     try:
         clip_duration = (clip_end - clip_start) if (clip_start is not None and clip_end is not None) else None
         vf = None
+        FRAME = _frame(aspect)
+        log.log(f"     Canvas : {aspect} {FRAME[0]}x{FRAME[1]} ({fit})")
 
         # ── Hook-first: convert the absolute hook window to clip-local seconds ──
         # The render input-seeks to clip_start, so everything past this point works
@@ -1532,13 +1796,16 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         if not burn and not overlay_only:
             # ── No-subtitle path: clean 9:16 video, nothing overlaid. ──
             log.log("     Subtitles OFF -> rendering clean 9:16 clip (no captions).")
-            vf = _build_render_filter("", "")
+            vf = _build_render_filter("", "", FRAME, fit)
         elif overlay_only:
             # ── Badge/title only: no transcript needed, so nothing is transcribed. ──
             log.log(f"     Subtitles OFF -> overlay-only render "
                     f"(part={'yes' if want_badge else 'no'}, title={'yes' if want_title else 'no'}).")
             _la_path, _la_family = _font_from_choice(english_font_choice, ENGLISH_FONTS, _get_latin_font)
-            fontsdir = _prepare_fontsdir([_la_path], job_dir)
+            # The headline may use a different face than the captions, so its file
+            # has to reach the same fontsdir or libass silently substitutes.
+            _ti_path, _ti_family = _font_from_choice(title_font_choice, ENGLISH_FONTS, _get_latin_font)
+            fontsdir = _prepare_fontsdir([_la_path, _ti_path], job_dir)
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".ass", delete=False,
                 dir=job_dir, prefix=f"clip{clip_index}_", encoding="utf-8"
@@ -1549,16 +1816,21 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 [], ass_path,
                 layout="single", language="english", position=position,
                 caption_style=caption_style, accent_color=accent_color,
+                caption_color=caption_color, caption_words=caption_words,
                 title=title, show_title=show_title,
                 hindi_font="Noto Sans Devanagari",
                 latin_font=_la_family or "Poppins",
+                title_font=_ti_family or "", title_style=title_style,
+                title_color=title_color,
                 clip_duration=render_duration,
                 video_box=_video_box(*(src_dims if src_dims and src_dims[0]
-                                       else _probe_dimensions(raw_path, log))),
+                                       else _probe_dimensions(raw_path, log)),
+                                     frame=FRAME, fit=fit),
+                aspect=aspect, fit=fit,
                 part_label=part_label, show_part_label=show_part_label,
                 caption_xy=caption_xy, title_xy=title_xy, part_xy=part_xy,
             )
-            vf = _build_render_filter(ass_path, fontsdir)
+            vf = _build_render_filter(ass_path, fontsdir, FRAME, fit)
         else:
             # 1. Ensure we have clip-local segments (with whatever language fields we need).
             if segments is None:
@@ -1579,6 +1851,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
 
             hi_path, hi_family = _font_from_choice(hindi_font_choice, HINDI_FONTS, _get_hindi_font)
             la_path, la_family = _font_from_choice(english_font_choice, ENGLISH_FONTS, _get_latin_font)
+            ti_path, ti_family = _font_from_choice(title_font_choice, ENGLISH_FONTS, _get_latin_font)
 
             if need_hindi and not hi_path:
                 log.log("     WARNING: NO Devanagari font found (bundled or system). "
@@ -1592,6 +1865,8 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 wanted_paths.append(hi_path)
             if need_latin and la_path:
                 wanted_paths.append(la_path)
+            if show_title and ti_path:
+                wanted_paths.append(ti_path)
             fontsdir = _prepare_fontsdir(wanted_paths, job_dir)
 
             # 3. Build the ASS for the chosen layout/language/position/style.
@@ -1604,9 +1879,9 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 src_w, src_h = src_dims
             else:
                 src_w, src_h = _probe_dimensions(raw_path, log)
-            vbox = _video_box(src_w, src_h)
+            vbox = _video_box(src_w, src_h, FRAME, fit)
             if vbox:
-                log.log(f"     Video band: y {vbox[0]:.0f}–{vbox[1]:.0f} of {SHORTS_H} "
+                log.log(f"     Video band: y {vbox[0]:.0f}–{vbox[1]:.0f} of {FRAME[1]} "
                         f"(src {src_w}x{src_h})")
 
             def _make_vf(segs, duration, tag=""):
@@ -1631,10 +1906,17 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                     position=position,
                     caption_style=caption_style,
                     accent_color=accent_color,
+                    caption_color=caption_color,
+                    caption_words=caption_words,
                     title=title,
                     show_title=show_title,
                     hindi_font=hindi_family,
                     latin_font=latin_family,
+                    title_font=ti_family or "",
+                    title_style=title_style,
+                    title_color=title_color,
+                    aspect=aspect,
+                    fit=fit,
                     clip_duration=duration,
                     video_box=vbox,
                     part_label=part_label,
@@ -1647,8 +1929,8 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                         f"title={'yes' if has_title else 'no'} (fontsdir={fontsdir or 'system'})")
                 if primary == 0 and secondary == 0 and not has_title:
                     log.log("     WARNING: nothing to overlay - rendering plain 9:16 video.")
-                    return _build_render_filter("", "")
-                return _build_render_filter(path, fontsdir)
+                    return _build_render_filter("", "", FRAME, fit)
+                return _build_render_filter(path, fontsdir, FRAME, fit)
 
             vf = _make_vf(segments, render_duration)
             if hook_local:
@@ -1662,14 +1944,32 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         # is preserved by -to being applied on the trimmed input.
         def _build_cmd(venc_args, filter_chain, use_hook, use_logo=True):
             cmd = ["ffmpeg", "-y"]
+            # Input 0 is ALWAYS the clip body, so the filter graph can count on it.
             if clip_start is not None and clip_end is not None:
                 cmd += ["-ss", f"{clip_start:.3f}", "-to", f"{clip_end:.3f}"]
             cmd += ["-i", raw_path]
+            next_idx = 1
+
+            # Input 1 (when hooked) is the SAME source seeked to the hook window, in
+            # ABSOLUTE source time — hook_local is clip-local, so add clip_start back.
+            # Two cheap seeks instead of one decode fanned out through split+trim;
+            # _build_hook_filter_complex explains why that difference is 10 GB.
+            hook_idx = None
+            if use_hook and hook_local:
+                hook_idx = next_idx
+                next_idx += 1
+                cmd += ["-ss", f"{clip_start + hook_local[0]:.3f}",
+                        "-to", f"{clip_start + hook_local[1]:.3f}", "-i", raw_path]
+
             lg = logo_cfg if use_logo else None
+            logo_idx = None
             if lg:
+                logo_idx = next_idx
+                next_idx += 1
                 # -loop 1 so a still PNG covers the whole clip rather than one frame.
                 cmd += ["-loop", "1", "-i", lg["path"]]
-            cmd += _filter_args(filter_chain, hook_local if use_hook else None, lg)
+
+            cmd += _filter_args(filter_chain, hook_idx, lg, logo_idx, FRAME)
             cmd += venc_args
             cmd += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                     "-shortest", final_output]
@@ -1688,7 +1988,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         #
         # Captions are remapped for the hooked timeline, so dropping the hook at rung 3
         # shifts them; they are rebuilt without the offset there rather than left adrift.
-        plain_vf = _build_render_filter("", "")
+        plain_vf = _build_render_filter("", "", FRAME, fit)
         has_logo = bool(logo_cfg)
         base = "captions + hook" if hook_local else "captions"
         if has_logo:
@@ -1809,6 +2109,13 @@ def execute_subtitle_workflow(
         position      = str(cfg.get("subtitle_position", "bottom")).lower()
         caption_style = str(cfg.get("caption_style", "outline")).lower()
         accent_color  = str(cfg.get("caption_accent", "") or "")
+        caption_color = str(cfg.get("caption_color", "") or "")
+        caption_words = cfg.get("caption_words", 0)
+        title_font_choice = str(cfg.get("title_font", "") or "").lower()
+        title_style   = str(cfg.get("title_style", "") or "").lower()
+        title_color   = str(cfg.get("title_color", "") or "")
+        aspect        = str(cfg.get("aspect", DEFAULT_ASPECT) or DEFAULT_ASPECT)
+        fit           = str(cfg.get("fit", "fit") or "fit").lower()
         hindi_font_choice   = str(cfg.get("hindi_font", "") or "").lower()
         english_font_choice = str(cfg.get("english_font", "") or "").lower()
         show_title    = bool(cfg.get("show_title", False))
@@ -1830,10 +2137,23 @@ def execute_subtitle_workflow(
             position = "bottom"
         if caption_style not in VALID_CAPTION_STYLES:
             caption_style = "outline"
+        # Resolved here purely so the log shows the number that will actually be
+        # used; make_caption_ass resolves it again per clip from the raw value.
+        words_on_screen = _resolve_words_on_screen(caption_words, caption_style)
         if hindi_font_choice and hindi_font_choice not in VALID_HINDI_FONTS:
             hindi_font_choice = ""
         if english_font_choice and english_font_choice not in VALID_ENGLISH_FONTS:
             english_font_choice = ""
+        if title_font_choice and title_font_choice not in VALID_ENGLISH_FONTS:
+            title_font_choice = ""
+        # "" is meaningful here — it means the original headline look — so an
+        # unknown style falls back to that rather than to "outline".
+        if title_style and title_style not in VALID_CAPTION_STYLES:
+            title_style = ""
+        if aspect not in ASPECTS:
+            aspect = DEFAULT_ASPECT
+        if fit not in ("fit", "fill"):
+            fit = "fit"
 
         # Post-selection features, all driven from the manifest so the CLI entry point
         # gets them too.
@@ -1850,8 +2170,16 @@ def execute_subtitle_workflow(
 
         log.section("CAPTION CONFIG")
         log.log(f"   burn={burn} | layout={layout} | language={language} | position={position} | "
-                f"style={caption_style} | accent={accent_color or 'default'} | title={show_title}")
+                f"style={caption_style} | title={show_title}")
+        log.log(f"   text={caption_color or 'style default'} | "
+                f"highlight={accent_color or 'default'} | "
+                f"words on screen={words_on_screen}"
+                f"{' (auto)' if not caption_words else ''}")
         log.log(f"   fonts: hindi={hindi_font_choice or 'auto'} | english={english_font_choice or 'auto'}")
+        if show_title:
+            log.log(f"   headline: font={title_font_choice or 'same as captions'} | "
+                    f"style={title_style or 'default yellow caps'} | "
+                    f"colour={title_color or 'from style'}")
         log.log(f"   hook-first={hook_first} ({hooked_clips}/{len(raw_clips)} clips) | "
                 f"council={want_council} | publish kit={want_kit} | "
                 f"logo={'yes' if logo_cfg else 'no'}")
@@ -2050,6 +2378,8 @@ def execute_subtitle_workflow(
         # file, so a single ffprobe replaces one-per-clip.
         src_video = manifest.get("video_path") or (raw_clips[0]["raw_path"] if raw_clips else None)
         src_dims = _probe_dimensions(src_video, log) if src_video else (None, None)
+        log.log(f"   Canvas: {aspect} {_frame(aspect)[0]}x{_frame(aspect)[1]} | "
+                f"{'crop to fill' if fit == 'fill' else 'fit with bars'}")
         log.log(f"   Source dimensions: {src_dims[0]}x{src_dims[1]}" if src_dims[0] else
                 "   Source dimensions: unknown (will probe per clip)")
 
@@ -2091,6 +2421,13 @@ def execute_subtitle_workflow(
                 position=position,
                 caption_style=caption_style,
                 accent_color=accent_color,
+                caption_color=caption_color,
+                caption_words=caption_words,
+                title_font_choice=title_font_choice,
+                title_style=title_style,
+                title_color=title_color,
+                aspect=aspect,
+                fit=fit,
                 hindi_font_choice=hindi_font_choice,
                 english_font_choice=english_font_choice,
                 show_title=show_title,
@@ -2221,7 +2558,12 @@ if __name__ == "__main__":
                         default=None,
                         help="Caption look: " + ", ".join(VALID_CAPTION_STYLES))
     parser.add_argument("--accent", default=None,
-                        help="Accent colour for karaoke/word_pop active word, e.g. '#FFE600'")
+                        help="Highlight colour for the karaoke/word_pop active word, e.g. '#FFE600'")
+    parser.add_argument("--caption-color", default=None,
+                        help="Caption TEXT colour for any style, e.g. '#E8F5E9'")
+    parser.add_argument("--words", type=int, default=None,
+                        help=f"Words on screen at once ({WORDS_ON_SCREEN_MIN}-{WORDS_ON_SCREEN_MAX}); "
+                             "omit for the style's own default")
     parser.add_argument("--title", action="store_true", default=None,
                         help="Overlay an AI-generated headline title")
     args = parser.parse_args()
@@ -2233,6 +2575,8 @@ if __name__ == "__main__":
     if args.position:       overrides["subtitle_position"] = args.position
     if args.style:          overrides["caption_style"] = args.style
     if args.accent:         overrides["caption_accent"] = args.accent
+    if args.caption_color:  overrides["caption_color"] = args.caption_color
+    if args.words:          overrides["caption_words"] = args.words
     if args.title:          overrides["show_title"] = True
 
     clips, log_path = execute_subtitle_workflow(

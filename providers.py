@@ -205,14 +205,57 @@ def _ollama_chat(prompt, temperature, json_mode, log):
 DEFAULT_CHAT_ORDER = "groq,gemini,openrouter,ollama"
 
 
-def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None):
+# Models the UI can offer for the selection pass, in the order they are shown.
+# key -> (provider, concrete model or None, label, one-line note)
+SELECTION_MODELS = [
+    ("auto",              (None, None, "Auto",
+                           "Try each provider in turn. Never fails while one key works.")),
+    ("groq:llama-3.3-70b-versatile", ("groq", "llama-3.3-70b-versatile", "Llama 3.3 70B",
+                           "Groq. The strongest judgement, and the default.")),
+    ("groq:llama-3.1-8b-instant",    ("groq", "llama-3.1-8b-instant", "Llama 3.1 8B",
+                           "Groq. Much faster and cheaper, rougher picks.")),
+    ("gemini",            ("gemini", None, "Gemini Flash",
+                           "Google. Good long-context reader; needs GEMINI_API_KEY.")),
+    ("openrouter",        ("openrouter", None, "OpenRouter",
+                           "Whatever OPENROUTER_MODEL points at.")),
+    ("ollama",            ("ollama", None, "Local (Ollama)",
+                           "Runs on this machine. No key, no network, no limits.")),
+]
+
+
+def selection_model_catalogue():
+    """The model list for the UI, each flagged with whether its key is actually set."""
+    st = provider_status().get("chat", {})
+    out = []
+    for key, (prov, model, label, note) in SELECTION_MODELS:
+        out.append({
+            "key": key, "label": label, "help": note,
+            "provider": prov or "auto",
+            # Ollama is probed lazily and Auto always has something to try, so
+            # neither is ever reported as unavailable.
+            "available": True if prov in (None, "ollama") else bool(st.get(prov)),
+        })
+    return out
+
+
+def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None,
+         prefer_model=None):
     """Run a single-prompt completion through the whole provider chain.
 
     Order is configurable via env CHAT_ORDER (comma list of
     groq,gemini,openrouter,ollama). Returns the raw response text (caller parses
     it), or "" if every provider failed. `json_mode=True` asks for strict JSON.
+
+    `prefer_model` is a key from SELECTION_MODELS. It moves that provider to the
+    front (and pins its model, for Groq) WITHOUT dropping the rest of the chain —
+    a chosen model that is rate-limited still falls back rather than failing the
+    job, which is the whole reason this function exists.
     """
     models = groq_models or DEFAULT_GROQ_MODELS
+    forced = dict(SELECTION_MODELS).get((prefer_model or "auto").strip())
+    forced_provider = forced[0] if forced else None
+    if forced and forced[1]:
+        models = [forced[1]] + [m for m in models if m != forced[1]]
     engines = {
         "groq": lambda: _groq_chat(prompt, temperature, json_mode, models, log),
         "gemini": lambda: _gemini_chat(prompt, temperature, json_mode, log),
@@ -221,6 +264,9 @@ def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None):
     }
     order_str = os.environ.get("CHAT_ORDER", DEFAULT_CHAT_ORDER)
     order = [o.strip().lower() for o in order_str.split(",") if o.strip()]
+    if forced_provider:
+        order = [forced_provider] + [o for o in order if o != forced_provider]
+        _say(log, f"    [chat] preferred model: {prefer_model}")
 
     for i, name in enumerate(order):
         fn = engines.get(name)
@@ -453,6 +499,50 @@ def run_cmd(cmd, timeout=None, retries=1, backoff=3, log=None, label=""):
         if attempt < retries:
             time.sleep(backoff * attempt)
     return last
+
+
+def run_cmd_streaming(cmd, timeout=None, log=None, label="", on_line=None):
+    """Like run_cmd, but hands every stdout line to `on_line` as it arrives.
+
+    run_cmd uses capture_output, which buffers until the process exits — fine for
+    ffprobe, useless for a ten-minute download the user is watching. This keeps the
+    same CompletedProcess return shape (rc 124 on timeout) so callers do not need a
+    second failure path. stderr is folded into stdout because yt-dlp splits progress
+    and warnings across both and the caller only wants one stream to scan.
+    """
+    label = label or (cmd[0] if cmd else "cmd")
+    buf = []
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+    except FileNotFoundError as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+    except Exception as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+    deadline = (time.time() + timeout) if timeout else None
+    try:
+        for line in proc.stdout:
+            buf.append(line)
+            if on_line:
+                try:
+                    on_line(line.rstrip("\n"))
+                except Exception:
+                    pass          # a broken progress callback must not kill the download
+            if deadline and time.time() > deadline:
+                proc.kill()
+                _say(log, f"    [{label}] TIMED OUT after {timeout}s")
+                return subprocess.CompletedProcess(cmd, 124, "".join(buf),
+                                                   f"timed out after {timeout}s")
+        proc.wait(timeout=30)
+    except Exception as e:
+        try: proc.kill()
+        except Exception: pass
+        return subprocess.CompletedProcess(cmd, 1, "".join(buf), str(e))
+
+    out = "".join(buf)
+    return subprocess.CompletedProcess(cmd, proc.returncode or 0, out,
+                                       "" if proc.returncode == 0 else out[-2000:])
 
 
 def have_binary(name):

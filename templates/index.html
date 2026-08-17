@@ -2176,6 +2176,15 @@ dialog::backdrop{
 
         <div class="field">
           <label class="switch">
+            <input type="checkbox" id="piksyMark" checked><span class="track"></span>
+            <span class="txt">Piksy watermark
+              <small>Burns the Piksy mark on every clip at 40% opacity, so anyone who reposts
+                your clip shows where it was made. Uploading your own logo replaces it.</small></span>
+          </label>
+        </div>
+
+        <div class="field">
+          <label class="switch">
             <input type="checkbox" id="showTitle"><span class="track"></span>
             <span class="txt">Put an AI headline on the video
               <small>Written per clip. Meme-format clips get a two-line "bro: / me:" headline; serious
@@ -2355,6 +2364,7 @@ const S = {
   aspect: "9:16", fit: "fit", model: "auto",
   titleStyle: "", titleFont: "", titleColor: "",
   logo: null, logoName: "", logoUrl: "", logoScale: .18, logoOpacity: 1,
+  piksyMark: true,
   // Drag placement. null = use the preset position. Fractions of the 1080x1920
   // frame, centre-anchored — exactly what the ASS \pos() tag takes.
   xy: { cap: null, title: null, part: null, logo: null },
@@ -2660,6 +2670,7 @@ function fitHelp() {
     : "Scales the whole picture to fit and pads with black bars. Nothing is ever lost.";
 }
 toggle("showTitle", "showTitle", () => { titleFields(); markCustom(); renderPreview(); });
+toggle("piksyMark", "piksyMark", renderPreview);
 
 /* The headline controls only mean anything when something is going to be burned:
    the AI headline, or a fixed series title in sequential mode. */
@@ -3391,6 +3402,7 @@ function getOptions() {
     caption_xy: S.xy.cap,
     title_xy: S.xy.title,
     part_xy: S.xy.part,
+    piksy_watermark: S.piksyMark,
     logo: S.logo || undefined,
     logo_scale: S.logoScale,
     logo_opacity: S.logoOpacity,

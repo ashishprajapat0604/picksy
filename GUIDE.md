@@ -287,6 +287,14 @@ where the last ended. A 10-minute video at 30s gives 20 parts; a 1-hour video gi
 > Turn captions **off** for this mode and it's much faster — with nothing to
 > transcribe, ShortsAI only has to cut and re-encode.
 
+### The Piksy watermark
+
+Every clip gets the Piksy logo in the corner at 40% opacity — faint enough not to
+distract, clear enough that anyone who reposts your clip shows where it came from.
+
+Don't want it? **Headline & logo → Piksy watermark → off.** Uploading your own logo
+replaces it automatically.
+
 ### Moving the captions, title and Part badge
 
 In the **Live preview**, drag any of them — the caption, the title, the "PART 1"

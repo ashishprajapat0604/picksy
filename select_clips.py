@@ -1677,6 +1677,8 @@ def execute_selection_workflow(
     # Sequential ("Part 1, Part 2, …") mode.
     # Podcast mode: which candidates to build ("qa" | "guest" | "both") and the
     # per-speaker caption colours.
+    # Piksy watermark: on by default so a reposted clip is traceable back here.
+    options.setdefault("piksy_watermark", True)
     options.setdefault("podcast_style", "both")
     options.setdefault("host_color", "")
     options.setdefault("guest_color", "")
@@ -1905,6 +1907,7 @@ def execute_selection_workflow(
                 # Podcast: who is who, and the colour each speaker's captions get.
                 "speaker_roles":     options.get("speaker_roles"),
                 "host_color":        options.get("host_color", ""),
+                "piksy_watermark":   bool(options.get("piksy_watermark", True)),
                 "guest_color":       options.get("guest_color", ""),
                 "caption_xy":        options.get("caption_xy"),
                 "title_xy":          options.get("title_xy"),

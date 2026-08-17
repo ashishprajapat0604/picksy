@@ -1520,6 +1520,16 @@ LOGO_MIN_SCALE, LOGO_MAX_SCALE = 0.03, 0.60
 LOGO_DEFAULT_SCALE = 0.18
 LOGO_DEFAULT_XY = (0.84, 0.07)      # top-right, clear of the caption band
 
+# The bundled Piksy mark, burned on every clip unless the user turns it off or
+# supplies their own logo. It is what makes a reposted clip traceable back here,
+# so it is ON by default — but it is a default, never a lock.
+# Resolved from __file__ rather than BASE_DIR: that constant is defined further
+# down this module, so referencing it here fails at import time.
+PIKSY_WATERMARK = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assets", "piksy_watermark.png")
+PIKSY_WATERMARK_OPACITY = 0.40      # visible, but never competing with the content
+PIKSY_WATERMARK_SCALE = 0.16
+
 
 def _norm_logo(cfg: dict) -> dict:
     """Validate the logo settings, or return {} when there is no usable logo.
@@ -1527,8 +1537,23 @@ def _norm_logo(cfg: dict) -> dict:
     Returns {path, scale, x, y, opacity} with everything clamped, so the filter
     builder can trust its input."""
     path = str((cfg or {}).get("logo_path", "") or "").strip()
-    if not path or not os.path.isfile(path):
-        return {}
+    own_logo = bool(path) and os.path.isfile(path)
+
+    # No logo of their own -> fall back to the Piksy watermark, unless it was
+    # explicitly switched off. A user logo always wins; the two never stack.
+    if not own_logo:
+        if not (cfg or {}).get("piksy_watermark", True):
+            return {}
+        if not os.path.isfile(PIKSY_WATERMARK):
+            return {}
+        xy = _norm_xy((cfg or {}).get("logo_xy")) or LOGO_DEFAULT_XY
+        return {
+            "path": PIKSY_WATERMARK,
+            "scale": PIKSY_WATERMARK_SCALE,
+            "x": xy[0], "y": xy[1],
+            "opacity": PIKSY_WATERMARK_OPACITY,
+            "is_watermark": True,
+        }
 
     def _f(key, default, lo, hi):
         try:
@@ -2269,9 +2294,16 @@ def execute_subtitle_workflow(
                            if rc.get("hook_start") is not None) if hook_first else 0
         # Validated once for the whole job — every clip shares the same watermark.
         logo_cfg = _norm_logo(cfg)
-        if cfg.get("logo_path") and not logo_cfg:
+        if cfg.get("logo_path") and not os.path.isfile(str(cfg.get("logo_path"))):
             log.log(f"   WARNING: logo '{cfg.get('logo_path')}' is missing on disk — "
-                    f"rendering without a watermark.")
+                    f"falling back to the Piksy watermark.")
+        if logo_cfg.get("is_watermark"):
+            log.log(f"   Watermark: Piksy at {logo_cfg['opacity']*100:.0f}% opacity "
+                    f"({logo_cfg['scale']*100:.0f}% width)")
+        elif logo_cfg:
+            log.log(f"   Watermark: your logo at {logo_cfg['opacity']*100:.0f}% opacity")
+        else:
+            log.log("   Watermark: none (Piksy mark switched off)")
 
         log.section("CAPTION CONFIG")
         log.log(f"   burn={burn} | layout={layout} | language={language} | position={position} | "

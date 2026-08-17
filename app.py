@@ -98,7 +98,7 @@ def serve_frontend():
 @app.get("/favicon.ico", include_in_schema=False)
 def serve_favicon():
     """Browsers request this unprompted; without it every page load logs a 404."""
-    path = os.path.join(BASE_DIR, "assets", "shortsai.ico")
+    path = os.path.join(BASE_DIR, "assets", "piksy.ico")
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="No icon bundled")
     return FileResponse(path, media_type="image/x-icon",

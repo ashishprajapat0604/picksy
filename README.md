@@ -172,6 +172,7 @@ pip install faster-whisper          # offline transcription, never rate-limited
 | Caption look | outline · box · white_box · bold_yellow · karaoke · neon · retro · shadow · fire · fade | outline |
 | Fonts | 8 Devanagari · 10 Latin | Noto / Poppins |
 | AI title line | on / off | off |
+| Piksy watermark | on / off (40% opacity) | on |
 
 ### Sequential parts mode
 
@@ -274,6 +275,18 @@ length, captions and mode are already right; change anything and the choice flip
 | YouTube Shorts | 9:16 | 30–60s | Best moments | Bold, headline on |
 | Instagram Reels | 9:16 | 40–60s | Hook first | Karaoke |
 | Instagram Feed | 4:5 | 20–45s | Best moments | Outline, raised clear of IG's caption bar |
+
+### Piksy watermark
+
+Every clip carries the Piksy mark at **40% opacity** by default, so a reposted clip
+shows where it was made. It is a default, not a lock:
+
+- **Upload your own logo** and it replaces the Piksy mark — the two never stack.
+- **Turn it off** with the toggle in *Headline & logo*, or `piksy_watermark: false`.
+- Position, size and opacity use the same drag-and-drop controls as any logo.
+
+A logo path that no longer exists on disk falls back to the Piksy mark rather than
+rendering nothing.
 
 ### Drag-and-drop placement
 

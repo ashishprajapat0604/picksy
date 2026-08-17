@@ -739,7 +739,7 @@ def _win_make_shortcut():
         warn("ShortsAI.bat missing — cannot create a shortcut")
         return False
 
-    icon = ASSETS / "shortsai.ico"
+    icon = ASSETS / "piksy.ico"
     # A PowerShell here-string would need escaping for every path, so values are
     # injected as variables with doubled single-quotes instead.
     def ps_str(p):
@@ -806,7 +806,7 @@ def _linux_make_shortcut():
         warn(f"Could not create {apps}: {e}")
         return False
 
-    icon = ASSETS / "shortsai.png"
+    icon = ASSETS / "piksy.png"
     # Exec must be an absolute command; %-signs are reserved in .desktop files.
     entry = (
         "[Desktop Entry]\n"

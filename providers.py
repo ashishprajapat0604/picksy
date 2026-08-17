@@ -179,10 +179,14 @@ _GEMINI_ENDPOINT = ("https://generativelanguage.googleapis.com/v1beta/models"
 _GEMINI_DEAD = set()
 
 
-def _gemini_models():
-    """Configured model first, then the built-in ladder (no duplicates)."""
+def _gemini_models(prefer=None):
+    """Preferred model first, then the configured one, then the built-in ladder.
+
+    `prefer` is how the UI's "Gemini Pro" choice reaches the wire. The rest of the
+    ladder stays behind it, so picking Pro and hitting its tighter quota falls back
+    to Flash instead of failing the job."""
     chosen = (os.environ.get("GEMINI_MODEL") or "").strip()
-    ordered = ([chosen] if chosen else []) + DEFAULT_GEMINI_MODELS
+    ordered = ([prefer] if prefer else []) + ([chosen] if chosen else []) + DEFAULT_GEMINI_MODELS
     seen, out = set(), []
     for m in ordered:
         if m and m not in seen:
@@ -208,7 +212,7 @@ def _gemini_extract(payload):
     return text.strip(), cand.get("finishReason") or ""
 
 
-def _gemini_chat(prompt, temperature, json_mode, log):
+def _gemini_chat(prompt, temperature, json_mode, log, prefer_model=None):
     """Google Gemini over plain REST. Returns text or None.
 
     Deliberately has NO SDK dependency. The google-generativeai package was an
@@ -232,7 +236,7 @@ def _gemini_chat(prompt, temperature, json_mode, log):
                        "generationConfig": cfg}).encode("utf-8")
     timeout = int(os.environ.get("GEMINI_TIMEOUT", "240"))
 
-    for model in _gemini_models():
+    for model in _gemini_models(prefer_model):
         if model in _GEMINI_DEAD:
             continue
         for attempt in range(1, 3):
@@ -330,6 +334,10 @@ SELECTION_MODELS = [
     ("gemini",            ("gemini", None, "Gemini Flash",
                            "Google. Reads the whole transcript in one pass — the default, "
                            "and the best pick for long videos.")),
+    ("gemini-pro",        ("gemini", "gemini-pro-latest", "Gemini Pro",
+                           "Google's reasoning model. Slower and on a tighter free quota, "
+                           "but the best judge of where a thought actually ends — worth it "
+                           "for interviews and podcasts.")),
     ("auto",              (None, None, "Auto",
                            "Try each provider in turn. Never fails while one key works.")),
     ("groq:llama-3.3-70b-versatile", ("groq", "llama-3.3-70b-versatile", "Llama 3.3 70B",
@@ -376,7 +384,8 @@ def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None,
     if forced and forced[1]:
         models = [forced[1]] + [m for m in models if m != forced[1]]
     engines = {
-        "gemini": lambda: _gemini_chat(prompt, temperature, json_mode, log),
+        "gemini": lambda: _gemini_chat(prompt, temperature, json_mode, log,
+                                       forced[1] if forced_provider == "gemini" else None),
         "groq": lambda: _groq_chat(prompt, temperature, json_mode, models, log),
         "openrouter": lambda: _openrouter_chat(prompt, temperature, json_mode, log),
     }
@@ -498,7 +507,11 @@ def _groq_whisper_transcribe(audio_path, language, log):
     return None
 
 
-def _deepgram_transcribe(audio_path, language, log):
+def _deepgram_transcribe(audio_path, language, log, diarize=False):
+    """diarize=True asks Deepgram for speaker labels, which arrive on every word
+    and utterance. That is what podcast mode cuts on (a clip should end when the
+    guest finishes answering, not mid-way into the next question) and what gives
+    the captions a colour per speaker."""
     api_key = os.environ.get("DEEPGRAM_API_KEY")
     if not api_key:
         return None
@@ -518,9 +531,12 @@ def _deepgram_transcribe(audio_path, language, log):
                 # api_key MUST be passed explicitly: deepgram-sdk 7.x dropped the
                 # no-arg constructor's env lookup, which silently broke transcription.
                 client = DeepgramClient(api_key=api_key)
+                kw = {}
+                if diarize:
+                    kw["diarize"] = True
                 response = client.listen.v1.media.transcribe_file(
                     request=buf, model=model, language=language,
-                    smart_format=True, utterances=True,
+                    smart_format=True, utterances=True, **kw,
                 )
                 if hasattr(response, "to_dict"):
                     data = response.to_dict()
@@ -533,9 +549,17 @@ def _deepgram_transcribe(audio_path, language, log):
                 for u in data.get("results", {}).get("utterances", []):
                     seg = {"start": u.get("start"), "end": u.get("end"),
                            "text": u.get("transcript"), "words": []}
+                    # speaker is absent unless diarize was requested; keeping it
+                    # None rather than 0 lets callers tell "one speaker" apart
+                    # from "we never asked".
+                    if u.get("speaker") is not None:
+                        seg["speaker"] = u.get("speaker")
                     for w in u.get("words", []):
-                        seg["words"].append({"word": w.get("punctuated_word", w.get("word")),
-                                             "start": w.get("start"), "end": w.get("end")})
+                        wd = {"word": w.get("punctuated_word", w.get("word")),
+                              "start": w.get("start"), "end": w.get("end")}
+                        if w.get("speaker") is not None:
+                            wd["speaker"] = w.get("speaker")
+                        seg["words"].append(wd)
                     out["segments"].append(seg)
                 if out["segments"]:
                     out["_engine"] = f"deepgram:{model}"
@@ -598,7 +622,7 @@ def _local_whisper_transcribe(audio_path, language, log):
     return None
 
 
-def transcribe_audio(audio_path, language="hi", log=None, prefer=None):
+def transcribe_audio(audio_path, language="hi", log=None, prefer=None, diarize=False):
     """Word-level transcription with full provider fallback.
 
     Order is configurable via env TRANSCRIBE_ORDER (comma list of
@@ -622,7 +646,18 @@ def transcribe_audio(audio_path, language="hi", log=None, prefer=None):
         fn = engines.get(name)
         if not fn:
             continue
-        data = fn(audio_path, language, log)
+        # Only Deepgram can label speakers. Podcast mode needs that, so when it is
+        # asked for, engines that cannot provide it are skipped rather than silently
+        # returning a transcript with no speakers (which would make podcast mode
+        # look broken instead of unavailable).
+        if diarize:
+            if name != "deepgram":
+                _say(log, f"  [transcribe] '{name}' cannot label speakers — skipped "
+                          f"(podcast mode needs Deepgram)")
+                continue
+            data = fn(audio_path, language, log, diarize=True)
+        else:
+            data = fn(audio_path, language, log)
         if data and data.get("segments"):
             _say(log, f"  [transcribe] SUCCESS via {data.get('_engine', name)} "
                       f"({len(data['segments'])} segments)")

@@ -126,17 +126,25 @@ def _slice_transcript(full_transcript_path: str, clip_start: float, clip_end: fl
             ws, we = w.get("start", seg_s), w.get("end", seg_e)
             if we <= clip_start or ws >= clip_end:
                 continue
-            words_in.append({
+            wd = {
                 "word": w.get("word", ""),
                 "start": max(0.0, ws - clip_start),
                 "end":   min(clip_end - clip_start, we - clip_start),
-            })
-        result_segments.append({
+            }
+            # Speaker labels must survive slicing, or podcast captions lose the
+            # colour that says who is talking.
+            if w.get("speaker") is not None:
+                wd["speaker"] = w.get("speaker")
+            words_in.append(wd)
+        entry = {
             "start": round(local_s, 3),
             "end":   round(local_e, 3),
             "text":  seg.get("text", "").strip(),
             "words": words_in,
-        })
+        }
+        if seg.get("speaker") is not None:
+            entry["speaker"] = seg.get("speaker")
+        result_segments.append(entry)
     return {"segments": result_segments}
 
 
@@ -526,7 +534,15 @@ def _chunk_word_cues(segments: list, lead_offset: float, clip_duration,
     duration is divided evenly across its words so subtitles still appear."""
     cues = []
     bucket = []  # list of (start, end, word)
+    bucket_spk = None       # speaker the current bucket belongs to
     for seg in segments:
+        # A cue must never mix two speakers: in a podcast the caption colour tells
+        # you WHO is talking, so a cue straddling a turn change would be a lie.
+        seg_spk = seg.get("speaker")
+        if bucket and seg_spk != bucket_spk:
+            cues.append(_flush_bucket(bucket, clip_duration)); bucket = []
+        bucket_spk = seg_spk
+
         seg_words = [w for w in seg.get("words", [])
                      if (w.get("word") or "").strip() and w.get("start") is not None and w.get("end") is not None]
 
@@ -932,6 +948,59 @@ def _style_row(name: str, font: str, preset: dict, align: int, margin_v: int,
     return f"Style: {name},{font},{size},{primary},{primary},{oc},{preset['back']},{tail}"
 
 
+def _inline_colour(ass_colour: str) -> str:
+    """An ASS inline primary-colour override from an '&H00BBGGRR' style value.
+
+    Style rows and inline overrides use different spellings of the same colour:
+    the style takes '&H00BBGGRR', the override takes '\\1c&HBBGGRR&'. Mixing them
+    up silently renders the default colour, so the conversion lives in one place.
+    """
+    v = (ass_colour or "").strip()
+    if not v.startswith("&H"):
+        return ""
+    body = v[2:].rstrip("&")
+    if len(body) == 8:           # AABBGGRR -> drop the alpha
+        body = body[2:]
+    if len(body) != 6:
+        return ""
+    return "{\\1c&H%s&}" % body.upper()
+
+
+def _speaker_ranges(segments: list, lead_offset: float = 0.0) -> list:
+    """[(start, end, speaker)] for segments that carry a speaker label."""
+    out = []
+    for s in segments or []:
+        if s.get("speaker") is None:
+            continue
+        try:
+            out.append((float(s.get("start", 0)) - lead_offset,
+                        float(s.get("end", 0)) - lead_offset,
+                        s.get("speaker")))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _speaker_at(ranges: list, t: float):
+    """Which speaker is talking at time t, or None.
+
+    Strict containment FIRST. A cue starts exactly where the previous segment ended,
+    so a tolerant match would hit the outgoing speaker and colour every turn's first
+    cue as the person who just stopped talking — the captions would lag a turn behind
+    the audio, which is worse than no colour at all.
+    """
+    for s, e, spk in ranges:
+        if s <= t < e:
+            return spk
+    # Nothing contained it (gaps between segments) — now allow a small tolerance.
+    best, best_gap = None, None
+    for s, e, spk in ranges:
+        gap = 0.0 if s <= t <= e else min(abs(t - s), abs(t - e))
+        if gap <= 0.25 and (best_gap is None or gap < best_gap):
+            best, best_gap = spk, gap
+    return best
+
+
 def _norm_xy(xy):
     """Accept {"x":0.5,"y":0.8} / (0.5,0.8) / [0.5,0.8] and return a clamped
     (x, y) fraction pair, or None. Anything malformed degrades to None so the
@@ -1165,7 +1234,8 @@ def make_caption_ass(segments: list, ass_path: str,
                      show_part_label: bool = False,
                      caption_xy=None,
                      title_xy=None,
-                     part_xy=None) -> tuple:
+                     part_xy=None,
+                     speaker_colours=None) -> tuple:
     """Write ONE ASS file on a 1080x1920 frame.
 
     layout == "single": ONE caption track in `language`, pinned to `position`, styled
@@ -1207,6 +1277,23 @@ def make_caption_ass(segments: list, ass_path: str,
 
     styles = []
     events = []
+
+    # Podcast mode: {speaker_id: '&H00BBGGRR'} so each voice gets its own colour.
+    spk_colours = speaker_colours or {}
+    spk_ranges = _speaker_ranges(segments, lead_offset) if spk_colours else []
+
+    def spk_prefix(cue_start, cue_end=None):
+        """Colour override for whoever is speaking at this cue.
+
+        Sampled at the cue's MIDPOINT, not its leading edge: the edge sits exactly
+        on a turn boundary and is ambiguous, the middle never is."""
+        if not spk_ranges:
+            return ""
+        t = cue_start if cue_end is None else (cue_start + cue_end) / 2.0
+        who = _speaker_at(spk_ranges, t)
+        if who is None:
+            return ""
+        return _inline_colour(spk_colours.get(who, ""))
 
     cap_xy = _norm_xy(caption_xy)
     ttl_xy = _norm_xy(title_xy)
@@ -1305,7 +1392,8 @@ def make_caption_ass(segments: list, ass_path: str,
             has_title = True
         up = dpreset["upper"]
         for c_start, c_end, text in hi_cues:
-            events.append(f"Dialogue: 0,{_fmt_ass_time(c_start)},{_fmt_ass_time(c_end)},HI,,0,0,0,,{hi_prefix}{_ass_escape(text)}")
+            events.append(f"Dialogue: 0,{_fmt_ass_time(c_start)},{_fmt_ass_time(c_end)},HI,,0,0,0,,"
+                          f"{hi_prefix}{spk_prefix(c_start, c_end)}{_ass_escape(text)}")
         for c_start, c_end, text in en_cues:
             t = text.upper() if up else text
             events.append(f"Dialogue: 0,{_fmt_ass_time(c_start)},{_fmt_ass_time(c_end)},EN,,0,0,0,,{en_prefix}{_ass_escape(t)}")
@@ -1349,7 +1437,8 @@ def make_caption_ass(segments: list, ass_path: str,
         # \pos must lead the line; animated styles then append their own override
         # blocks after it, which ASS applies cumulatively.
         for s, e, text in ev:
-            events.append(f"Dialogue: 0,{_fmt_ass_time(s)},{_fmt_ass_time(e)},SUB,,0,0,0,,{cap_prefix}{text}")
+            events.append(f"Dialogue: 0,{_fmt_ass_time(s)},{_fmt_ass_time(e)},SUB,,0,0,0,,"
+                          f"{cap_prefix}{spk_prefix(s, e)}{text}")
         primary_count, secondary_count = len(ev), 0
 
     header = (
@@ -1709,6 +1798,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                              caption_xy=None,
                              title_xy=None,
                              part_xy=None,
+                             speaker_colours=None,
                              hook_start: float = None,
                              hook_end: float = None,
                              logo: dict = None) -> str:
@@ -1829,6 +1919,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 aspect=aspect, fit=fit,
                 part_label=part_label, show_part_label=show_part_label,
                 caption_xy=caption_xy, title_xy=title_xy, part_xy=part_xy,
+                speaker_colours=speaker_colours,
             )
             vf = _build_render_filter(ass_path, fontsdir, FRAME, fit)
         else:
@@ -1924,6 +2015,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                     caption_xy=caption_xy,
                     title_xy=title_xy,
                     part_xy=part_xy,
+                    speaker_colours=speaker_colours,
                 )
                 log.log(f"     Tracks : {primary} primary cues / {secondary} secondary cues / "
                         f"title={'yes' if has_title else 'no'} (fontsdir={fontsdir or 'system'})")
@@ -2122,6 +2214,19 @@ def execute_subtitle_workflow(
         # Sequential extras + free (drag-and-drop) overlay placement.
         series_title    = str(cfg.get("series_title", "") or "").strip()
         show_part_label = bool(cfg.get("show_part_label", True))
+        # Podcast: map speaker id -> caption colour, from the roles the selection
+        # stage worked out. Absent roles (not a podcast job) leaves this empty and
+        # every caption keeps the single chosen colour.
+        speaker_colours = {}
+        _roles = cfg.get("speaker_roles") or {}
+        _host_hex = str(cfg.get("host_color", "") or "").strip()
+        _guest_hex = str(cfg.get("guest_color", "") or "").strip()
+        if _roles:
+            if _roles.get("host") is not None and _host_hex:
+                speaker_colours[_roles["host"]] = _hex_to_ass(_host_hex)
+            if _roles.get("guest") is not None and _guest_hex:
+                speaker_colours[_roles["guest"]] = _hex_to_ass(_guest_hex)
+
         caption_xy = _norm_xy(cfg.get("caption_xy"))
         title_xy   = _norm_xy(cfg.get("title_xy"))
         part_xy    = _norm_xy(cfg.get("part_xy"))
@@ -2205,6 +2310,14 @@ def execute_subtitle_workflow(
             whisper_full = os.path.join(job_dir, "transcript_full.json")
             have_dg_key = bool((os.environ.get("DEEPGRAM_API_KEY") or "").strip())
             have_whisper = os.path.exists(whisper_full)
+            # Podcast jobs MUST slice the full transcript rather than re-transcribe
+            # each clip: only the full pass was diarised, so a fresh per-clip call
+            # comes back with no speaker labels and the captions lose their colour.
+            if speaker_colours and have_whisper:
+                if engine != "whisper":
+                    log.log("   Podcast job: slicing the diarised full transcript so "
+                            "speaker labels (and their caption colours) survive")
+                engine = "whisper"
             # Deepgram only when explicitly requested AND a real key exists.
             if engine == "deepgram" and not have_dg_key:
                 log.log("   SUBTITLE_ENGINE=deepgram but no DEEPGRAM_API_KEY -> using whisper-slice")
@@ -2437,6 +2550,7 @@ def execute_subtitle_workflow(
                 caption_xy=caption_xy,
                 title_xy=title_xy,
                 part_xy=part_xy,
+                speaker_colours=speaker_colours,
                 # Hook-first cold open, chosen during selection. None for clips that
                 # were too short for one, and for every sequential part.
                 hook_start=rc.get("hook_start") if hook_first else None,

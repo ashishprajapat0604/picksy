@@ -1772,6 +1772,12 @@ dialog::backdrop{
   .rail{grid-column:1/-1}
 }
 
+/* Speaker colour rows (podcast mode). */
+.spk-row{display:grid; grid-template-columns:58px minmax(0,1fr); gap:10px;
+  align-items:center; margin-bottom:8px}
+.spk-lbl{font-size:var(--t-sm); color:var(--text-2); font-weight:600}
+@media (max-width:860px){ .spk-row{grid-template-columns:minmax(0,1fr); gap:5px} }
+
 /* The preset row reads as a row of cards, not a stack. */
 .choices-row{display:grid; gap:8px; grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
 
@@ -1938,6 +1944,12 @@ dialog::backdrop{
                 <span class="d">Opens on the clip's strongest line as a cold open, then plays it in
                   full. Fixed at 40s–1:00, picked by Gemini, and every clip is a complete thought.</span></span>
             </button>
+            <button type="button" class="choice" data-v="podcast" aria-pressed="false">
+              <span class="mark"></span>
+              <span><span class="t">Podcast / interview</span>
+                <span class="d">Cuts on who is speaking, not the clock — a question plus the
+                  whole answer, so a clip never runs into the next question. Needs a Deepgram key.</span></span>
+            </button>
             <button type="button" class="choice" data-v="sequential" aria-pressed="false">
               <span class="mark"></span>
               <span><span class="t">Sequential parts</span>
@@ -1953,6 +1965,33 @@ dialog::backdrop{
             whole transcript in one pass, and a cold open chosen from a partial view is guesswork.</p>
           <p class="help">A model that is rate-limited falls back to the others rather than
             failing the job, so a pick here is a preference, not a hard requirement.</p>
+        </div>
+
+        <!-- Podcast-only controls. -->
+        <div id="podOnly" hidden>
+          <div class="field">
+            <span class="lbl">What counts as a clip</span>
+            <div class="seg" id="podStyle" role="group" aria-label="Podcast clip shape">
+              <button type="button" data-v="both" aria-pressed="true">Both</button>
+              <button type="button" data-v="qa" aria-pressed="false">Question + answer</button>
+              <button type="button" data-v="guest" aria-pressed="false">Guest only</button>
+            </div>
+            <p class="help">“Question + answer” keeps the host's question as the hook.
+              “Guest only” takes a strong point the guest makes on its own.</p>
+          </div>
+          <div class="field">
+            <span class="lbl">Caption colour per speaker</span>
+            <div class="spk-row">
+              <span class="spk-lbl">Host</span>
+              <div class="swatches" id="hostSwatches"></div>
+            </div>
+            <div class="spk-row">
+              <span class="spk-lbl">Guest</span>
+              <div class="swatches" id="guestSwatches"></div>
+            </div>
+            <p class="help">Who is talking is worked out from the audio — the host asks, the
+              guest explains. Leave both unset to keep one colour for everyone.</p>
+          </div>
         </div>
 
         <!-- Sequential-only controls. Kept in their own block so the two jobs
@@ -2308,6 +2347,7 @@ const S = {
   src: "online", file: null, quality: "best",
   mode: "multi", lenMin: 20, lenMax: 40, count: 15, autoCount: true,
   partLen: 30, seriesTitle: "", partLabel: true,
+  podStyle: "both", hostColor: "", guestColor: "",
   burn: true, layout: "single", lang: "hindi", pos: "bottom",
   style: "outline", accent: "#66BB6A", capColor: "", words: 0,
   hindiFont: "", latinFont: "",
@@ -2338,7 +2378,7 @@ const STEPS = [
                                                   .filter(Boolean).join(" + ") || "Clips only" },
 ];
 const MODE_NAME = { multi: "Many clips", best: "Best only", hook: "Hook first",
-                    sequential: "Sequential" };
+                    podcast: "Podcast", sequential: "Sequential" };
 const LANG_NAME = { hindi: "हिन्दी", english: "English", hinglish: "Hinglish" };
 const PART_LENS = [15, 20, 30, 45, 60, 90, 120, 180, 300];
 const CLIP_LENS = [7, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 75, 90];
@@ -2536,6 +2576,8 @@ function press(groupId, v) {
     b.setAttribute("aria-pressed", String(b.dataset.v === v)));
 }
 
+group("podStyle", (v) => { S.podStyle = v; markCustom(); sync(); });
+
 group("presets", (v) => applyPreset(v));
 
 /* Clips */
@@ -2552,8 +2594,12 @@ group("clipModes", (v) => {
    out of step with what the backend actually does. */
 function applyMode() {
   const seq = S.mode === "sequential", hook = S.mode === "hook";
+  const pod = S.mode === "podcast";
   $("seqOnly").hidden = !seq;
-  $("selOnly").hidden = seq;
+  $("podOnly").hidden = !pod;
+  // Podcast builds its own candidates from speaker turns, so the highlight-mode
+  // length and count controls do not apply to it.
+  $("selOnly").hidden = seq || pod;
   // Hook mode is defined as 40s-1:00; showing a length control the renderer
   // overrides would be a lie, so it is hidden and the reason is stated.
   $("lenOnly").hidden = hook;
@@ -2871,6 +2917,9 @@ function buildSwatches(boxId, palette, key, label) {
 buildSwatches("capSwatches", CAP_COLORS, "capColor", "Caption colour");
 buildSwatches("swatches", ACCENTS, "accent", "Highlight colour");
 buildSwatches("titleSwatches", CAP_COLORS, "titleColor", "Headline colour");
+// Podcast mode: one colour per speaker, so you can tell who is talking at a glance.
+buildSwatches("hostSwatches", CAP_COLORS, "hostColor", "Host caption colour");
+buildSwatches("guestSwatches", CAP_COLORS, "guestColor", "Guest caption colour");
 
 /* Which caption colour controls apply to the style that is currently chosen,
    and what the words-on-screen setting actually resolves to. */
@@ -3313,6 +3362,9 @@ function getOptions() {
     chunk_len: S.partLen,
     series_title: $("seriesTitle").value.trim(),
     show_part_label: S.partLabel,
+    podcast_style: S.podStyle,
+    host_color: S.hostColor,
+    guest_color: S.guestColor,
     clip_prompt: $("brief").value.trim(),
     burn_subtitles: S.burn,
     subtitle_layout: S.layout,

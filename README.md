@@ -158,7 +158,9 @@ pip install faster-whisper          # offline transcription, never rate-limited
 |---|---|---|
 | Clip brief | free text — describe what you want | *(blank)* |
 | Platform preset | YouTube Shorts · Instagram Reels · Instagram Feed · Custom | Custom |
-| Clip mode | `multi` (~1/min, 20–40s) · `best` (fewer, 40–60s) · `hook` (cold open, 40–60s) · `sequential` (whole video → parts) | multi |
+| Clip mode | `multi` (~1/min, 20–40s) · `best` (fewer, 40–60s) · `hook` (cold open, 40–60s) · `podcast` (speaker turns) · `sequential` (whole video → parts) | multi |
+| Podcast clip shape | `both` · `qa` (question + answer) · `guest` (guest only) | both |
+| Speaker caption colours | one colour per speaker (host / guest) | off |
 | Number of clips | auto (1 per minute) or 5–60 | auto |
 | Part length *(sequential)* | 10s – 5min | 30s |
 | Series title *(sequential)* | free text, burned on every part | *(blank)* |
@@ -213,6 +215,43 @@ plays in full.
 > If a transcript has almost no punctuation, strict enforcement would return nothing —
 > so it falls back to best-effort snapping and says so in the log. A job never returns
 > zero clips because the rule was too strict.
+
+### Podcast / interview mode
+
+In a two-person show the meaningful unit is **a question and the answer it gets**. A
+selector that picks free timestamps has no idea where an answer ends, so it stops
+part-way into the next question and the clip trails off into a change of subject.
+Sentence boundaries do not fix this — a new question *is* a new sentence.
+
+The fix is structural rather than a better prompt:
+
+1. Deepgram labels every word with a speaker (`diarize`).
+2. Words become **turns**; short back-channels ("haan", "right") are absorbed rather
+   than treated as turn changes that would chop an answer in half.
+3. The host is identified by behaviour — asks more, says less per turn — not by talk
+   time alone, which a chatty host would break.
+4. **Candidates** are assembled whole: a host question plus the guest's complete
+   answer, or a standalone guest point.
+5. The model then **chooses among those candidates** instead of inventing timestamps.
+
+That last step is the point. A wrong pick now costs one mediocre clip; it can no
+longer produce a clip that stops mid-answer. Clips open on the question itself, not
+on the "welcome back to the show" that preceded it.
+
+Falls back to normal highlight selection when the transcript has no speaker labels
+(no Deepgram key, or a solo video) — the mode never empties a job.
+
+### Two-colour captions
+
+With a host and guest colour set, each caption takes the colour of whoever is
+speaking, so a viewer can tell the two apart at a glance. A single caption line never
+mixes two speakers, and the colour is sampled at the cue's midpoint — sampling the
+leading edge lands exactly on a turn boundary and colours every turn's first line as
+the person who just *stopped* talking.
+
+Podcast jobs slice the diarised full transcript for captions instead of
+re-transcribing each clip, because a fresh per-clip call comes back with no speaker
+labels at all.
 
 ### Sentence-accurate cutting
 

@@ -257,7 +257,14 @@ It's only a starting point: change anything you like and the choice quietly swit
 | **Many clips** | Roughly one clip per minute — the widest net |
 | **Best moments only** | Fewer, stronger clips (about one per two minutes) |
 | **Hook first** | Opens on the clip's best line, then plays it in full |
+| **Podcast / interview** | A question plus the whole answer — never cuts into the next question |
 | **Sequential parts** | The whole video split end to end into Part 1, Part 2, Part 3… |
+
+**Podcast / interview** is the one for two-person shows. It works out who is the host
+and who is the guest from the audio, and cuts on speaker turns — so a clip ends when
+the guest finishes answering, instead of running into the next question. You can also
+give the host and guest different caption colours. It needs a Deepgram key; without
+one it quietly falls back to normal clip picking.
 
 **Hook first** is the one to try if clips feel slow to start. It fixes clips at 40s–1:00,
 uses Gemini to pick them, and guarantees each clip is a complete thought — it will never

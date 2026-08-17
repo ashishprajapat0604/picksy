@@ -10,6 +10,7 @@ import traceback
 import datetime
 import gdown
 import providers
+import podcast
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -280,7 +281,8 @@ def extract_audio(video_path: str, output_path: str, log: DiagnosticLog) -> str:
 # Full-video transcription (used ONLY for highlight selection)
 # ─────────────────────────────────────────────────────────────
 
-def transcribe_full_video(audio_path: str, job_dir: str, log: DiagnosticLog) -> str:
+def transcribe_full_video(audio_path: str, job_dir: str, log: DiagnosticLog,
+                          diarize: bool = False) -> str:
     """Transcribe the full video for AI highlight selection AND subtitle slicing.
 
     ROBUST: tries a full provider chain so a single outage never sinks a job —
@@ -291,7 +293,7 @@ def transcribe_full_video(audio_path: str, job_dir: str, log: DiagnosticLog) -> 
     """
     log.log("[Step 3] Transcribing full video (robust multi-provider) for highlight selection...")
 
-    data = providers.transcribe_audio(audio_path, language="hi", log=log)
+    data = providers.transcribe_audio(audio_path, language="hi", log=log, diarize=diarize)
     if not data or not data.get("segments"):
         raise RuntimeError(
             "All transcription providers failed (Groq / Deepgram / local Whisper). "
@@ -415,25 +417,42 @@ def split_into_sentences(segments: list, log: DiagnosticLog = None) -> list:
             out.append(seg)
             continue
 
-        bucket = []
-        for w in words:
-            bucket.append(w)
-            if _ends_a_sentence(w.get("word", "")):
-                out.append({
-                    "start": bucket[0]["start"],
-                    "end": bucket[-1]["end"],
-                    "text": " ".join((b.get("word") or "").strip() for b in bucket).strip(),
-                    "words": list(bucket),
-                })
-                bucket = []
-        if bucket:
-            # Trailing words with no closing punctuation still belong to the video.
-            out.append({
+        # The speaker label MUST survive this rebuild: podcast mode cuts on it and
+        # the captions colour by it. Dropping it here made a diarised transcript
+        # look undiarised by the time anything downstream read it.
+        def _emit(bucket):
+            if not bucket:
+                return
+            # Per-WORD labels win: this bucket may be one half of a segment that
+            # spanned a speaker change, in which case the parent's label is wrong
+            # for at least one half.
+            labels = [b.get("speaker") for b in bucket if b.get("speaker") is not None]
+            spk = max(set(labels), key=labels.count) if labels else seg.get("speaker")
+            entry = {
                 "start": bucket[0]["start"],
                 "end": bucket[-1]["end"],
                 "text": " ".join((b.get("word") or "").strip() for b in bucket).strip(),
                 "words": list(bucket),
-            })
+            }
+            if spk is not None:
+                entry["speaker"] = spk
+            out.append(entry)
+
+        bucket = []
+        for w in words:
+            # A speaker change ends the sentence too, even mid-clause: two people
+            # never share one caption line.
+            if bucket and w.get("speaker") is not None \
+                    and bucket[-1].get("speaker") is not None \
+                    and w.get("speaker") != bucket[-1].get("speaker"):
+                _emit(bucket)
+                bucket = []
+            bucket.append(w)
+            if _ends_a_sentence(w.get("word", "")):
+                _emit(bucket)
+                bucket = []
+        # Trailing words with no closing punctuation still belong to the video.
+        _emit(bucket)
 
     if log is not None and len(out) != len(segments):
         complete = sum(1 for s in out if _ends_a_sentence(s.get("text", "")))
@@ -1318,7 +1337,7 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     #                       hook plus its full context does not fit in less, and
     #                       every clip must be a COMPLETE thought (see below).
     clip_mode = str(options.get("clip_mode", "multi")).lower()
-    if clip_mode not in ("multi", "best", "hook"):
+    if clip_mode not in ("multi", "best", "hook", "podcast"):
         clip_mode = "multi"
     log.log(f"  Clip mode: {clip_mode}")
 
@@ -1326,7 +1345,7 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     #   - "auto" (default): one clip per minute of video (15-min video -> ~15 clips).
     #     In "best" mode this halves to the strongest moments only.
     #   - an explicit number: used directly, but never more than the per-mode cap.
-    if clip_mode in ("best", "hook"):
+    if clip_mode in ("best", "hook", "podcast"):
         # Both are "fewer, stronger" modes: a 40-60s clip cannot be cut once a
         # minute without overlapping itself.
         max_for_video = max(1, min(math.ceil(minutes / 2), _ABS_MAX_CLIPS))
@@ -1357,7 +1376,10 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     asked_max = options.get("max_clip_len")
     untouched = (asked_min in (None, "", DEFAULT_MIN_CLIP_LEN)
                  and asked_max in (None, "", DEFAULT_MAX_CLIP_LEN))
-    if clip_mode == "hook":
+    if clip_mode == "podcast":
+        # A question and the answer that pays it off does not fit in 20s.
+        min_len, max_len = 30.0, 75.0
+    elif clip_mode == "hook":
         # Not negotiable: the mode IS "40-60s, complete thought, opened on its
         # best line". A shorter window cannot hold a hook plus its own context,
         # so the length control is hidden in this mode rather than ignored.
@@ -1375,6 +1397,29 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
         log.log("  Complete-thought enforcement: ON (clips must end on a finished sentence)")
 
     valid = []
+
+    # ── PODCAST MODE ───────────────────────────────────────────────────────────
+    # Cuts on speaker turns, not the clock: candidates are whole question-and-answer
+    # pairs (or whole guest points), so a clip physically cannot stop part-way into
+    # the next question. Falls through to normal selection when the transcript has
+    # no speaker labels — a missing Deepgram key must not empty the job.
+    if clip_mode == "podcast":
+        log.section("PODCAST SELECTION (speaker turns)")
+        pod_highlights, roles = podcast.select(
+            segments, num_clips, min_len, max_len, log,
+            style=str(options.get("podcast_style", "both")).lower(),
+            prefer_model=str(options.get("selection_model",
+                                         providers.DEFAULT_SELECTION_MODEL)),
+            clip_prompt=str(options.get("clip_prompt", "") or "").strip(),
+        )
+        if pod_highlights:
+            # Carried to the burn stage so each speaker's captions get their colour.
+            options["speaker_roles"] = roles
+            with open(highlights_path, "w", encoding="utf-8") as f:
+                json.dump(pod_highlights, f, indent=4, ensure_ascii=False)
+            return highlights_path, pod_highlights
+        log.log("  Podcast selection produced nothing — continuing with normal "
+                "highlight selection so the job still returns clips.")
 
     # Run the modular, chunked LLM selector and turn its picks into validated clips.
     # per_chunk is derived inside the selector, which is the only place that knows how
@@ -1630,6 +1675,11 @@ def execute_selection_workflow(
     options.setdefault("video_quality", "best")             # best|1080|720|480|360 (link downloads)
     options.setdefault("show_title", False)
     # Sequential ("Part 1, Part 2, …") mode.
+    # Podcast mode: which candidates to build ("qa" | "guest" | "both") and the
+    # per-speaker caption colours.
+    options.setdefault("podcast_style", "both")
+    options.setdefault("host_color", "")
+    options.setdefault("guest_color", "")
     options.setdefault("chunk_len", DEFAULT_CHUNK_LEN)      # seconds per part
     options.setdefault("part_label_format", "Part {n}")     # {n} = number, {total} = count
     options.setdefault("series_title", "")                  # fixed title burned on every part
@@ -1721,10 +1771,16 @@ def execute_selection_workflow(
             # ── STAGE 2: ONE Whisper transcription of the full video (for selection only).
             # We deliberately do NOT run Deepgram on the whole video — that bills the full
             # duration. Deepgram runs later, per selected clip only (much cheaper here).
-            if status_callback: status_callback("Step 3/4: Transcribing full video (Whisper)...")
+            if status_callback: status_callback("Step 3/4: Transcribing full video...")
             log.section("STEP 3 - FULL TRANSCRIPTION")
+            # Podcast mode cuts on speaker turns, so it needs diarisation. Asking for
+            # it costs nothing extra on Deepgram and is ignored by the other engines.
+            want_diarize = (str(options.get("clip_mode", "")).lower() == "podcast")
+            if want_diarize:
+                log.log("   Podcast mode: requesting speaker labels (diarisation)")
             try:
-                transcript_path = transcribe_full_video(full_audio_path, job_dir, log)
+                transcript_path = transcribe_full_video(full_audio_path, job_dir, log,
+                                                        diarize=want_diarize)
             except Exception as e:
                 log.error(f"Transcription unavailable: {e}", e)
 
@@ -1846,6 +1902,10 @@ def execute_selection_workflow(
                 "show_part_label":   options.get("show_part_label", True),
                 # Free placement (drag & drop in the UI). Each is {"x":0..1,"y":0..1}
                 # in 9:16 frame fractions, or None to use the preset position.
+                # Podcast: who is who, and the colour each speaker's captions get.
+                "speaker_roles":     options.get("speaker_roles"),
+                "host_color":        options.get("host_color", ""),
+                "guest_color":       options.get("guest_color", ""),
                 "caption_xy":        options.get("caption_xy"),
                 "title_xy":          options.get("title_xy"),
                 "part_xy":           options.get("part_xy"),

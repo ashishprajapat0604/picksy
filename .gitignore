@@ -51,3 +51,6 @@ workflow-files.zip
 
 # Claude Code local (machine-specific) settings
 .claude/settings.local.json
+
+# Per-run logs (logs/shortsailogs) — runtime data, not code
+logs/

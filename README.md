@@ -109,6 +109,38 @@ the most viral moments generally.
 
 ---
 
+## Logs
+
+Two files per run, for two different questions.
+
+**`logs/shortsailogs/<time>_<job>_<stage>.log`** — *what happened?* One line per
+step, one line per AI call, and a verdict. Read this first:
+
+```
+  STEPS
+    [OK  ]    0.6s  Extract audio
+    [OK  ]   10.3s  Transcribe full video
+    [OK  ]   54.9s  Pick clips              2 clip(s)
+
+  AI CALLS   (which model was asked, and what it said)
+    [FAIL] transcribe  deepgram nova-3            HTTP 401
+    [OK  ] transcribe  groq whisper-large-v3      17 segments
+    [FAIL] chat        gemini gemini-3.7-flash    HTTP 503
+    [OK  ] chat        gemini gemini-flash-latest
+
+  RESULT  : 2 clip(s) selected
+  FAILURES: 0 step(s), 2 model call(s)
+```
+
+That run **succeeded** despite two model failures — which is the point of the
+fallback chains, and the reason failed calls are listed separately from failed
+steps. A failed call that was covered is information; a failed *step* is a problem.
+
+**`output/<job>/DIAGNOSTIC_REPORT.txt`** — *why, exactly?* Every ffmpeg command,
+every prompt, every retry. Reach for it only when the short log is not enough.
+
+---
+
 ## Built to not break
 
 Every step that can fail has somewhere to fall back to, so one outage never sinks a job.

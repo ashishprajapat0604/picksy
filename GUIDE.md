@@ -361,9 +361,20 @@ private or restricted videos, see the "Private / age-restricted videos" section 
 
 ### Something else went wrong
 
-Every job writes a detailed log. Look in the ShortsAI folder under
-`output/<job-id>/DIAGNOSTIC_REPORT.txt` — it records each step and exactly where
-things failed.
+Open the newest file in **`logs/shortsailogs/`** inside the ShortsAI folder. It is a
+short, plain-English list of what ran and what failed:
+
+```
+    [OK  ]   10.3s  Transcribe full video
+    [FAIL] transcribe  deepgram nova-3    HTTP 401
+    [OK  ] transcribe  groq whisper-large-v3
+```
+
+A `[FAIL]` on a *model* is often fine — it means one AI service was down and another
+covered for it. A `[FAIL]` on a *step* is the real problem, and it names the cause.
+
+For the full detail (every command, every retry) see
+`output/<job-id>/DIAGNOSTIC_REPORT.txt`.
 
 ---
 

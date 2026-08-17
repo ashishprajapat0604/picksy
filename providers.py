@@ -33,6 +33,8 @@ import time
 import shutil
 import subprocess
 
+import joblog
+
 # Load .env here rather than only in app.py: every entry point (the server, the
 # burn_subtitles.py CLI, run.py's self-test) imports this module, so keys are
 # always present no matter how the pipeline is started.
@@ -145,17 +147,23 @@ def _groq_chat(prompt, temperature, json_mode, models, log):
         for attempt in range(1, attempts + 1):
             try:
                 resp = client.chat.completions.create(model=model, **kwargs)
+                joblog.ai("chat", "groq", model, ok=True)
                 return resp.choices[0].message.content.strip()
             except Exception as e:
                 status = getattr(e, "status_code", None)
                 if status in _NON_RETRYABLE:
                     _say(log, f"    [chat] groq {model}: non-retryable {status}: {e}")
+                    joblog.ai("chat", "groq", model, ok=False, detail=f"HTTP {status}")
                     break
                 if status == 404:
                     _say(log, f"    [chat] groq model '{model}' not available on this key — skipping")
+                    joblog.ai("chat", "groq", model, ok=False, detail="404 not on this key")
                     break
                 if attempt >= attempts:
                     _say(log, f"    [chat] groq {model} gave up after {attempts} attempts: {e}")
+                    joblog.ai("chat", "groq", model, ok=False,
+                              detail=f"gave up after {attempts} tries"
+                                     + (f" (HTTP {status})" if status else ""))
                     break
                 wait = _retry_after_seconds(e, 2.0 * attempt)
                 kind = "rate-limited" if status == 429 else "failed"
@@ -249,8 +257,10 @@ def _gemini_chat(prompt, temperature, json_mode, log, prefer_model=None):
                     payload = json.loads(resp.read().decode("utf-8"))
                 text, finish = _gemini_extract(payload)
                 if text:
+                    joblog.ai("chat", "gemini", model, ok=True)
                     return text
                 _say(log, f"    [chat] gemini {model} returned no text (finish={finish})")
+                joblog.ai("chat", "gemini", model, ok=False, detail=f"empty (finish={finish})")
                 break
             except urllib.error.HTTPError as e:
                 body = ""
@@ -262,13 +272,18 @@ def _gemini_chat(prompt, temperature, json_mode, log, prefer_model=None):
                     # Retired/unknown model id — move down the ladder, permanently.
                     _GEMINI_DEAD.add(model)
                     _say(log, f"    [chat] gemini model '{model}' unavailable (404) — trying next")
+                    joblog.ai("chat", "gemini", model, ok=False, detail="404 retired model")
                     break
                 if e.code in _NON_RETRYABLE:
                     _say(log, f"    [chat] gemini: non-retryable {e.code}: {body}")
+                    joblog.ai("chat", "gemini", model, ok=False, detail=f"HTTP {e.code}")
                     return None
                 wait = _retry_after_seconds(e, 2.0 * attempt)
                 _say(log, f"    [chat] gemini {model} attempt {attempt} failed "
                           f"(HTTP {e.code}) — waiting {wait:.0f}s")
+                if attempt >= 2:
+                    joblog.ai("chat", "gemini", model, ok=False,
+                              detail=f"HTTP {e.code}" + (" rate limited" if e.code == 429 else ""))
                 time.sleep(wait)
             except Exception as e:
                 _say(log, f"    [chat] gemini {model} attempt {attempt} failed: {e}")
@@ -407,6 +422,7 @@ def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None,
         if i + 1 < len(order):
             _say(log, f"    [chat] '{name}' unavailable -> trying '{order[i + 1]}'")
     _say(log, "    [chat] ALL chat providers failed (returning empty)")
+    joblog.ai("chat", "ALL PROVIDERS", "", ok=False, detail="every provider failed")
     return ""
 
 
@@ -495,6 +511,7 @@ def _groq_whisper_transcribe(audio_path, language, log):
                                 s["words"].append(w)
                                 break
                 if segs:
+                    joblog.ai("transcribe", "groq", model, ok=True, detail=f"{len(segs)} segments")
                     return {"segments": segs, "words": top_words, "_engine": f"groq:{model}"}
             except Exception as e:
                 status = getattr(e, "status_code", None)
@@ -563,13 +580,18 @@ def _deepgram_transcribe(audio_path, language, log, diarize=False):
                     out["segments"].append(seg)
                 if out["segments"]:
                     out["_engine"] = f"deepgram:{model}"
+                    joblog.ai("transcribe", "deepgram", model, ok=True,
+                              detail=f"{len(out['segments'])} segments"
+                                     + (" (diarised)" if diarize else ""))
                     return out
                 _say(log, f"  [transcribe] Deepgram {model} returned no utterances")
+                joblog.ai("transcribe", "deepgram", model, ok=False, detail="no utterances")
                 break
             except Exception as e:
                 status = getattr(e, "status_code", None)
                 if status in _NON_RETRYABLE:
                     _say(log, f"  [transcribe] Deepgram {model}: non-retryable {status}: {e}")
+                    joblog.ai("transcribe", "deepgram", model, ok=False, detail=f"HTTP {status}")
                     return None
                 _say(log, f"  [transcribe] Deepgram {model} attempt {attempt} failed: {e}")
                 time.sleep(2 * attempt)
@@ -616,6 +638,8 @@ def _local_whisper_transcribe(audio_path, language, log):
                                     "text": seg.text.strip(), "words": words})
         if out["segments"]:
             out["_engine"] = f"local:{model_name}"
+            joblog.ai("transcribe", "local-whisper", model_name, ok=True,
+                      detail=f"{len(out['segments'])} segments")
             return out
     except Exception as e:
         _say(log, f"  [transcribe] local whisper failed: {e}")
@@ -654,6 +678,7 @@ def transcribe_audio(audio_path, language="hi", log=None, prefer=None, diarize=F
             if name != "deepgram":
                 _say(log, f"  [transcribe] '{name}' cannot label speakers — skipped "
                           f"(podcast mode needs Deepgram)")
+                joblog.ai("transcribe", name, "", ok=False, detail="skipped: cannot diarise")
                 continue
             data = fn(audio_path, language, log, diarize=True)
         else:
@@ -663,6 +688,7 @@ def transcribe_audio(audio_path, language="hi", log=None, prefer=None, diarize=F
                       f"({len(data['segments'])} segments)")
             return data
     _say(log, "  [transcribe] ALL transcription providers failed")
+    joblog.ai("transcribe", "ALL ENGINES", "", ok=False, detail="every engine failed")
     return None
 
 

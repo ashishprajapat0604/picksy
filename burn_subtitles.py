@@ -13,6 +13,7 @@ import argparse
 import providers
 import viral_council
 import publish_kit
+import joblog
 
 # ─────────────────────────────────────────────────────────────
 # Diagnostic Logger
@@ -2200,6 +2201,7 @@ def execute_subtitle_workflow(
     if manifest_path is None:
         manifest_path = os.path.join(job_dir, "clips_manifest.json")
 
+    joblog.start(os.path.basename(os.path.normpath(job_dir)), "render")
     log = DiagnosticLog(job_dir)
     log.section("JOB INFO")
     log.log(f"   Job dir       : {job_dir}")
@@ -2411,9 +2413,13 @@ def execute_subtitle_workflow(
             need_translit  = (layout == "single" and language == "hinglish")
 
             if need_translate:
+                joblog.begin("Translate to English")
                 batch_translate_clips(all_segment_lists, log)
+                joblog.end("Translate to English", ok=True)
             if need_translit:
+                joblog.begin("Romanise to Hinglish")
                 batch_transliterate_clips(all_segment_lists, log)
+                joblog.end("Romanise to Hinglish", ok=True)
 
             # If the language pass produced nothing at all (every chat provider down),
             # rendering would give blank captions. Falling back to the source Devanagari
@@ -2435,7 +2441,10 @@ def execute_subtitle_workflow(
             # older single-purpose pass is skipped — otherwise it is two LLM calls for
             # one overlay.
             if show_title and not series_title and not want_kit:
+                joblog.begin("Write headlines")
                 titles = batch_generate_titles(all_segment_lists, log)
+                joblog.end("Write headlines", ok=any(titles),
+                           detail=f"{sum(1 for t in titles if t)}/{len(titles)} written")
                 clip_titles = {order[i]: titles[i] for i in range(len(order))}
             elif series_title:
                 log.log(f"   Series title: \"{series_title}\" (AI title generation skipped)")
@@ -2495,7 +2504,10 @@ def execute_subtitle_workflow(
                 if status_callback:
                     status_callback("AI council is ranking clips by view potential...")
                 try:
+                    joblog.begin("Rank clips (viral council)")
                     council_verdicts = viral_council.convene(briefs, log)
+                    joblog.end("Rank clips (viral council)", ok=bool(council_verdicts),
+                               detail=f"{len(council_verdicts or [])} judged")
                 except Exception as e:
                     # Ranking is a bonus on top of the clips — never lose a finished
                     # render because the council choked.
@@ -2505,7 +2517,10 @@ def execute_subtitle_workflow(
                 if status_callback:
                     status_callback("Writing titles, captions and hashtags...")
                 try:
+                    joblog.begin("Write titles + hashtags")
                     kits = publish_kit.generate(briefs, log)
+                    joblog.end("Write titles + hashtags", ok=bool(kits),
+                               detail=f"{len(kits or {})} clip(s)")
                 except Exception as e:
                     log.error(f"Publish kit failed (clips are unaffected): {e}", e)
 
@@ -2594,6 +2609,8 @@ def execute_subtitle_workflow(
                 status_callback(f"Rendered {done_count['n']}/{len(raw_clips)} clips...")
             return idx, out
 
+        joblog.fact("encoder", _enc_name)
+        joblog.begin("Render clips")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_process, rc): rc["index"] for rc in raw_clips}
             for fut in concurrent.futures.as_completed(futures):
@@ -2607,6 +2624,13 @@ def execute_subtitle_workflow(
             out = results.get(rc["index"])
             if out:
                 final_clips.append(out)
+
+        # One line for the whole render, naming how many clips actually came out.
+        _want = len(raw_clips)
+        _got = len(final_clips)
+        joblog.end("Render clips", ok=(_got == _want and _got > 0),
+                   detail=f"{_got}/{_want} produced"
+                          + ("" if _got == _want else "  <-- some clips failed"))
 
         # ── Posting sheets: one <clip>_POST.txt beside each rendered clip ──
         # Written after the render because each sheet is named for the finished file
@@ -2667,9 +2691,16 @@ def execute_subtitle_workflow(
     except Exception as e:
         log.section("SUBTITLE PIPELINE CRASHED")
         log.error(f"Unhandled exception: {e}", e)
+        joblog.step("Render pipeline", ok=False, detail=str(e)[:110])
         final_clips = []
 
     log.finalize(final_clips)
+
+    joblog.fact("clips", len(final_clips))
+    short = joblog.finish(f"{len(final_clips)} clip(s) rendered" if final_clips
+                          else "NO clips rendered")
+    if short:
+        log.log(f"\nShort run log: {short}")
     return final_clips, log.path
 
 

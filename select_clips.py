@@ -11,6 +11,7 @@ import datetime
 import gdown
 import providers
 import podcast
+import joblog
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1612,6 +1613,8 @@ def execute_selection_workflow(
     job_dir = os.path.join(BASE_DIR, "output", job_id)
     os.makedirs(job_dir, exist_ok=True)
 
+    # The short, scannable companion to DIAGNOSTIC_REPORT.txt — see logs/shortsailogs/.
+    joblog.start(job_id, "select", source=(url or local_file_path or ""))
     log = DiagnosticLog(job_dir)
     log.section("JOB INFO")
     log.log(f"   Job ID   : {job_id}")
@@ -1709,15 +1712,18 @@ def execute_selection_workflow(
             log.log(f"   File exists      : {os.path.exists(local_file_path)}")
             log.log(f"   File size        : {os.path.getsize(local_file_path) if os.path.exists(local_file_path) else 'N/A'} bytes")
             video_path = local_file_path
+            joblog.step("Load local video", ok=True)
         else:
             if status_callback: status_callback("Step 1/4: Downloading video...")
             log.section("STEP 1 - VIDEO DOWNLOAD")
             # yt-dlp reports per-file percentages; forward them straight to the
             # same status line the rest of the pipeline writes to.
+            joblog.begin("Download video")
             video_path = download_video(
                 url, job_dir, log, options.get("video_quality", "best"),
                 progress_callback=(lambda msg, pct: status_callback(f"Step 1/4: {msg}"))
                                   if status_callback else None)
+            joblog.end("Download video", ok=True)
 
         # ── SEQUENTIAL MODE ──────────────────────────────────────────────────
         # Splitting the whole video into Part 1 / Part 2 / Part 3 needs no AI and
@@ -1751,12 +1757,17 @@ def execute_selection_workflow(
             if options.get("burn_subtitles", True):
                 if status_callback: status_callback("Step 3/4: Extracting audio...")
                 log.section("STEP 3 - AUDIO + TRANSCRIPTION (for captions)")
+                joblog.begin("Extract audio")
                 full_audio_path = extract_audio(
                     video_path, os.path.join(job_dir, "audio.mp3"), log)
                 try:
+                    joblog.end("Extract audio", ok=True)
+                    joblog.begin("Transcribe full video")
                     transcript_path = transcribe_full_video(full_audio_path, job_dir, log)
+                    joblog.end("Transcribe full video", ok=True)
                 except Exception as e:
                     log.error(f"Transcription unavailable: {e}", e)
+                    joblog.end("Transcribe full video", ok=False, detail=str(e)[:90])
                     log.log("   Captions disabled for this job — parts will still be cut.")
                     options["burn_subtitles"] = False
             else:
@@ -1768,7 +1779,9 @@ def execute_selection_workflow(
         else:
             if status_callback: status_callback("Step 2/4: Extracting audio...")
             log.section("STEP 2 - AUDIO EXTRACTION")
+            joblog.begin("Extract audio")
             full_audio_path = extract_audio(video_path, os.path.join(job_dir, "audio.mp3"), log)
+            joblog.end("Extract audio", ok=True)
 
             # ── STAGE 2: ONE Whisper transcription of the full video (for selection only).
             # We deliberately do NOT run Deepgram on the whole video — that bills the full
@@ -1781,10 +1794,13 @@ def execute_selection_workflow(
             if want_diarize:
                 log.log("   Podcast mode: requesting speaker labels (diarisation)")
             try:
+                joblog.begin("Transcribe full video")
                 transcript_path = transcribe_full_video(full_audio_path, job_dir, log,
                                                         diarize=want_diarize)
+                joblog.end("Transcribe full video", ok=True)
             except Exception as e:
                 log.error(f"Transcription unavailable: {e}", e)
+                joblog.end("Transcribe full video", ok=False, detail=str(e)[:90])
 
         # ── STAGE 3: AI clip selection (chunked LLM; no video cutting here) ──
         # Sequential mode already decided its parts above and skips this entirely.
@@ -1792,7 +1808,10 @@ def execute_selection_workflow(
             if status_callback:
                 status_callback("Step 4/4: AI is finding the most engaging moments...")
             if transcript_path:
+                joblog.begin("Pick clips")
                 _, highlights = get_ai_highlights(transcript_path, job_dir, log, options)
+                joblog.end("Pick clips", ok=bool(highlights),
+                           detail=f"{len(highlights)} clip(s)" if highlights else "none found")
             else:
                 # LAST RESORT: every ASR provider failed. Rather than returning nothing,
                 # cut evenly spaced clips off the clock. Captions are force-disabled for
@@ -1832,9 +1851,11 @@ def execute_selection_workflow(
                         hook_segments = json.load(f).get("segments", [])
                 except (OSError, ValueError) as e:
                     log.error(f"Could not re-read transcript for hook selection: {e}")
+            joblog.begin("Choose cold opens")
             hooks_made = select_hooks(highlights, hook_segments, log,
                                       hook_len=options.get("hook_len", HOOK_LEN_DEFAULT),
                                       prefer_model=str(options.get("selection_model", providers.DEFAULT_SELECTION_MODEL)))
+            joblog.end("Choose cold opens", ok=True, detail=f"{hooks_made} clip(s) got one")
             with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
                 json.dump(highlights, f, indent=4, ensure_ascii=False)
 
@@ -1928,9 +1949,18 @@ def execute_selection_workflow(
     except Exception as e:
         log.section("SELECTION PIPELINE CRASHED")
         log.error(f"Unhandled exception: {e}", e)
+        joblog.step("Selection pipeline", ok=False, detail=str(e)[:110])
         raw_clips = []
         highlights = []
 
     log.finalize(raw_clips)
+
+    # Write the short run log next to the detailed report.
+    joblog.fact("mode", options.get("clip_mode", "multi"))
+    joblog.fact("model", options.get("selection_model", "auto"))
+    short = joblog.finish(f"{len(raw_clips)} clip(s) selected" if raw_clips
+                          else "NO clips selected")
+    if short:
+        log.log(f"\nShort run log: {short}")
 
     return raw_clips, highlights, log.path

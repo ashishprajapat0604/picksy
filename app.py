@@ -651,12 +651,15 @@ def health():
 # Keys the setup screen can manage. label/help drive the UI; `required` marks the
 # ones without which nothing works at all.
 MANAGED_KEYS = [
-    {"key": "GROQ_API_KEY", "label": "Groq", "required": True,
-     "help": "Free. Powers transcription + AI selection.", "url": "https://console.groq.com/keys"},
-    {"key": "DEEPGRAM_API_KEY", "label": "Deepgram", "required": False,
-     "help": "Optional. Best Hindi caption accuracy.", "url": "https://console.deepgram.com/signup"},
     {"key": "GEMINI_API_KEY", "label": "Google Gemini", "required": False,
-     "help": "Optional fallback when Groq is rate-limited.", "url": "https://aistudio.google.com/apikey"},
+     "help": "Free. The default clip picker — reads a whole long video in one pass.",
+     "url": "https://aistudio.google.com/apikey"},
+    {"key": "DEEPGRAM_API_KEY", "label": "Deepgram", "required": False,
+     "help": "Free credit. Best Hindi transcription, and what the captions are timed from.",
+     "url": "https://console.deepgram.com/signup"},
+    {"key": "GROQ_API_KEY", "label": "Groq", "required": True,
+     "help": "Free. Transcription fallback, and an alternative clip picker.",
+     "url": "https://console.groq.com/keys"},
     {"key": "OPENROUTER_API_KEY", "label": "OpenRouter", "required": False,
      "help": "Optional last-resort text fallback.", "url": "https://openrouter.ai/keys"},
 ]

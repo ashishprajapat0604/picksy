@@ -18,10 +18,10 @@ groq>=0.11                    # Whisper transcription + translation/transliterat
 deepgram-sdk>=5,<8            # per-clip transcription (nova-3); v5+ API (listen.v1.media). 7.x no-arg
                              # DeepgramClient() no longer reads DEEPGRAM_API_KEY — key is passed explicitly in code.
 
-# Robustness fallback providers (kick in automatically when Groq/Deepgram error out).
-google-generativeai>=0.8     # free-tier Gemini fallback for ALL text tasks (selection,
-                             #   translation, transliteration, titles). Set GEMINI_API_KEY.
-                             #   Optional — pipeline still runs on Groq alone without it.
+# NOTE: Gemini needs NO package. It is the DEFAULT clip picker and is called over
+# plain REST from the standard library, so setting GEMINI_API_KEY is genuinely all
+# that is required. (It used to depend on google-generativeai, which meant a missing
+# package silently disabled a perfectly good key — hence no SDK here on purpose.)
 
 # Optional OFFLINE transcription fallback — never rate-limits / 500s. Recommended on
 # the production GPU box (RTX 3050): set LOCAL_WHISPER_MODEL=medium, device auto-detects CUDA.

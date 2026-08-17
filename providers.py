@@ -8,10 +8,10 @@ limits, network blips) must never sink a job. Every capability here is a
 
 Capabilities
 ------------
-  chat()                  Text/JSON completion. Chain: Groq -> Gemini ->
-                          OpenRouter -> local Ollama. Order: CHAT_ORDER env.
-  transcribe_audio()      Word-level transcription. Chain: Groq Whisper ->
-                          Deepgram nova-3 -> local faster-whisper (offline).
+  chat()                  Text/JSON completion. Chain: Gemini -> Groq ->
+                          OpenRouter. Order: CHAT_ORDER env.
+  transcribe_audio()      Word-level transcription. Chain: Deepgram nova-3 ->
+                          Groq Whisper -> local faster-whisper (offline).
                           Order: TRANSCRIBE_ORDER env.
   run_cmd()               subprocess with a timeout and retry/backoff, so a
                           transient ffmpeg/yt-dlp failure is retried instead of
@@ -59,17 +59,73 @@ def _say(log, msg):
 
 
 # ─────────────────────────────────────────────────────────────
-# CHAT  (Groq  ->  Google Gemini)
+# CHAT  (Google Gemini  ->  Groq  ->  OpenRouter)
 # ─────────────────────────────────────────────────────────────
 
 DEFAULT_GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 # A non-retryable HTTP status means "trying again won't help" (auth/bad request).
-_NON_RETRYABLE = (400, 401, 403, 404)
+_NON_RETRYABLE = (400, 401, 403)
+
+
+def _retry_after_seconds(err, fallback):
+    """How long to wait after a 429, read from the provider's own headers.
+
+    Groq's free tier is token-per-minute limited, and it says exactly how long the
+    caller must wait. Sleeping a blind 2s and giving up — which is what this used to
+    do — turns one throttled call into a failed job, so honour the header when it is
+    there and cap it so a pathological value cannot stall the pipeline."""
+    headers = getattr(getattr(err, "response", None), "headers", None) or \
+              getattr(err, "headers", None) or {}
+    for name in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+        try:
+            raw = (headers.get(name) or "").strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            continue
+        secs = _parse_duration(raw)
+        if secs is not None and secs > 0:
+            return min(75.0, max(1.0, secs + 1.0))
+    return fallback
+
+
+# Order matters: 'ms' must be tried before 'm', or "185ms" reads as 185 MINUTES.
+_DURATION_UNITS = (("ms", 0.001), ("h", 3600.0), ("m", 60.0), ("s", 1.0))
+_DURATION_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|h|m|s)", re.I)
+
+
+def _parse_duration(raw):
+    """Seconds from a Retry-After value, or None if it is not a duration.
+
+    Two formats show up in practice and they must not be confused. HTTP's own
+    Retry-After is a bare integer count of seconds ("60"), while Groq reports
+    Go-style compound durations in its rate-limit headers — "2m52.8s", "6s", and
+    very commonly sub-second values like "185ms". Reading those milliseconds as
+    minutes is a 60000x error in the direction that hurts: it would park the
+    pipeline for the full backoff cap on a header that meant "carry on in a fifth
+    of a second"."""
+    try:
+        return float(raw)          # bare seconds, per the HTTP spec
+    except (TypeError, ValueError):
+        pass
+    total, matched = 0.0, False
+    for value, unit in _DURATION_TOKEN.findall(str(raw)):
+        for name, mult in _DURATION_UNITS:
+            if unit.lower() == name:
+                total += float(value) * mult
+                matched = True
+                break
+    return total if matched else None
 
 
 def _groq_chat(prompt, temperature, json_mode, models, log):
-    """Try each Groq model with light retry/backoff. Returns text or None."""
+    """Try each Groq model with rate-limit-aware retry/backoff. Returns text or None.
+
+    Groq's free tier caps llama-3.3-70b at 12k tokens/minute, and a Hindi transcript
+    tokenises at roughly 0.5 tokens per character — so a couple of chunks in a row can
+    exhaust the whole minute. A 429 here is normal and recoverable, and is treated as
+    such: wait out the window the header names rather than burning the attempt."""
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         return None
@@ -84,8 +140,9 @@ def _groq_chat(prompt, temperature, json_mode, models, log):
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
+    attempts = int(os.environ.get("GROQ_MAX_ATTEMPTS", "3"))
     for model in models:
-        for attempt in range(1, 3):
+        for attempt in range(1, attempts + 1):
             try:
                 resp = client.chat.completions.create(model=model, **kwargs)
                 return resp.choices[0].message.content.strip()
@@ -94,38 +151,124 @@ def _groq_chat(prompt, temperature, json_mode, models, log):
                 if status in _NON_RETRYABLE:
                     _say(log, f"    [chat] groq {model}: non-retryable {status}: {e}")
                     break
-                _say(log, f"    [chat] groq {model} attempt {attempt} failed: {e}")
-                time.sleep(2 * attempt)
+                if status == 404:
+                    _say(log, f"    [chat] groq model '{model}' not available on this key — skipping")
+                    break
+                if attempt >= attempts:
+                    _say(log, f"    [chat] groq {model} gave up after {attempts} attempts: {e}")
+                    break
+                wait = _retry_after_seconds(e, 2.0 * attempt)
+                kind = "rate-limited" if status == 429 else "failed"
+                _say(log, f"    [chat] groq {model} attempt {attempt} {kind} — waiting {wait:.0f}s")
+                time.sleep(wait)
     return None
 
 
+# Gemini models tried in order, first one that answers wins. Google retires model
+# ids on a rolling basis (gemini-2.0-flash and gemini-2.5-flash are both 404 to new
+# keys now), which is exactly why this is a LIST and not a constant: a retired
+# default used to take the whole provider down silently. The `-latest` alias sits in
+# the middle as the always-valid safety net.
+DEFAULT_GEMINI_MODELS = ["gemini-3.7-flash", "gemini-flash-latest", "gemini-3.5-flash"]
+
+_GEMINI_ENDPOINT = ("https://generativelanguage.googleapis.com/v1beta/models"
+                    "/{model}:generateContent")
+
+# Model ids that 404'd this process — never retried, so a long job pays the dead-model
+# cost once instead of once per transcript chunk.
+_GEMINI_DEAD = set()
+
+
+def _gemini_models():
+    """Configured model first, then the built-in ladder (no duplicates)."""
+    chosen = (os.environ.get("GEMINI_MODEL") or "").strip()
+    ordered = ([chosen] if chosen else []) + DEFAULT_GEMINI_MODELS
+    seen, out = set(), []
+    for m in ordered:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _gemini_extract(payload):
+    """Pull the answer text out of a generateContent response.
+
+    Gemini's flash models think before they answer, and those reasoning parts come
+    back in the SAME parts array flagged `thought: true`. Concatenating everything
+    blindly prepends the model's scratchpad to the JSON and breaks json.loads, so
+    thought parts are dropped here."""
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return "", (payload.get("promptFeedback") or {}).get("blockReason") or "no candidates"
+    cand = candidates[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts
+                   if isinstance(p, dict) and not p.get("thought"))
+    return text.strip(), cand.get("finishReason") or ""
+
+
 def _gemini_chat(prompt, temperature, json_mode, log):
-    """Google Gemini free-tier fallback. Returns text or None."""
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    """Google Gemini over plain REST. Returns text or None.
+
+    Deliberately has NO SDK dependency. The google-generativeai package was an
+    install-time trap: when it was missing (which it was), a perfectly valid
+    GEMINI_API_KEY still reported the provider as unavailable and the UI greyed the
+    Gemini card out with "key not set". urllib is in the standard library, so a key
+    on its own is now genuinely sufficient. This also accepts both the legacy
+    'AIza…' keys and the current 'AQ.…' AI Studio format, since the wire protocol is
+    the same for both."""
+    api_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
     if not api_key:
         return None
-    try:
-        import google.generativeai as genai
-    except Exception:
-        _say(log, "    [chat] gemini sdk not installed (pip install google-generativeai) — skipping")
-        return None
+    import urllib.request
+    import urllib.error
 
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-    try:
-        genai.configure(api_key=api_key)
-        cfg = {"temperature": temperature}
-        if json_mode:
-            cfg["response_mime_type"] = "application/json"
-        model = genai.GenerativeModel(model_name)
+    cfg = {"temperature": temperature,
+           "maxOutputTokens": int(os.environ.get("GEMINI_MAX_TOKENS", "8192"))}
+    if json_mode:
+        cfg["responseMimeType"] = "application/json"
+    data = json.dumps({"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                       "generationConfig": cfg}).encode("utf-8")
+    timeout = int(os.environ.get("GEMINI_TIMEOUT", "240"))
+
+    for model in _gemini_models():
+        if model in _GEMINI_DEAD:
+            continue
         for attempt in range(1, 3):
             try:
-                resp = model.generate_content(prompt, generation_config=cfg)
-                return (resp.text or "").strip()
+                req = urllib.request.Request(
+                    _GEMINI_ENDPOINT.format(model=model), data=data,
+                    headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                text, finish = _gemini_extract(payload)
+                if text:
+                    return text
+                _say(log, f"    [chat] gemini {model} returned no text (finish={finish})")
+                break
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", "replace")[:200]
+                except Exception:
+                    pass
+                if e.code == 404:
+                    # Retired/unknown model id — move down the ladder, permanently.
+                    _GEMINI_DEAD.add(model)
+                    _say(log, f"    [chat] gemini model '{model}' unavailable (404) — trying next")
+                    break
+                if e.code in _NON_RETRYABLE:
+                    _say(log, f"    [chat] gemini: non-retryable {e.code}: {body}")
+                    return None
+                wait = _retry_after_seconds(e, 2.0 * attempt)
+                _say(log, f"    [chat] gemini {model} attempt {attempt} failed "
+                          f"(HTTP {e.code}) — waiting {wait:.0f}s")
+                time.sleep(wait)
             except Exception as e:
-                _say(log, f"    [chat] gemini {model_name} attempt {attempt} failed: {e}")
+                _say(log, f"    [chat] gemini {model} attempt {attempt} failed: {e}")
                 time.sleep(2 * attempt)
-    except Exception as e:
-        _say(log, f"    [chat] gemini setup failed: {e}")
     return None
 
 
@@ -171,55 +314,31 @@ def _openrouter_chat(prompt, temperature, json_mode, log):
     return None
 
 
-def _ollama_chat(prompt, temperature, json_mode, log):
-    """Local Ollama fallback — no API key, no network, no rate limits. This is the
-    last resort that keeps text tasks alive when every hosted provider is down.
-    Only attempted when a local Ollama server is actually reachable."""
-    import urllib.request
-    import urllib.error
+DEFAULT_CHAT_ORDER = "gemini,groq,openrouter"
 
-    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-    model = os.environ.get("OLLAMA_MODEL", "llama3.1")
-    body = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temperature},
-    }
-    if json_mode:
-        body["format"] = "json"
-    try:
-        req = urllib.request.Request(
-            f"{host}/api/generate",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            parsed = json.loads(resp.read().decode("utf-8"))
-        return (parsed.get("response") or "").strip()
-    except Exception as e:
-        _say(log, f"    [chat] ollama unavailable at {host}: {e}")
-        return None
-
-
-DEFAULT_CHAT_ORDER = "groq,gemini,openrouter,ollama"
+# The default picker is Gemini, not Groq. Selection is the one task in the pipeline
+# that has to read a WHOLE transcript, and the two providers are not comparable
+# there: Gemini Flash takes a 19-minute Hindi transcript (~12k tokens) in a single
+# call, while Groq's free tier allows 12k tokens PER MINUTE across all calls — so the
+# same transcript has to be split into a dozen chunks that then throttle each other.
+DEFAULT_SELECTION_MODEL = "gemini"
 
 
 # Models the UI can offer for the selection pass, in the order they are shown.
 # key -> (provider, concrete model or None, label, one-line note)
 SELECTION_MODELS = [
+    ("gemini",            ("gemini", None, "Gemini Flash",
+                           "Google. Reads the whole transcript in one pass — the default, "
+                           "and the best pick for long videos.")),
     ("auto",              (None, None, "Auto",
                            "Try each provider in turn. Never fails while one key works.")),
     ("groq:llama-3.3-70b-versatile", ("groq", "llama-3.3-70b-versatile", "Llama 3.3 70B",
-                           "Groq. The strongest judgement, and the default.")),
+                           "Groq. Strong judgement, but a small free-tier budget: long "
+                           "videos get split up and can hit rate limits.")),
     ("groq:llama-3.1-8b-instant",    ("groq", "llama-3.1-8b-instant", "Llama 3.1 8B",
                            "Groq. Much faster and cheaper, rougher picks.")),
-    ("gemini",            ("gemini", None, "Gemini Flash",
-                           "Google. Good long-context reader; needs GEMINI_API_KEY.")),
     ("openrouter",        ("openrouter", None, "OpenRouter",
                            "Whatever OPENROUTER_MODEL points at.")),
-    ("ollama",            ("ollama", None, "Local (Ollama)",
-                           "Runs on this machine. No key, no network, no limits.")),
 ]
 
 
@@ -231,9 +350,9 @@ def selection_model_catalogue():
         out.append({
             "key": key, "label": label, "help": note,
             "provider": prov or "auto",
-            # Ollama is probed lazily and Auto always has something to try, so
-            # neither is ever reported as unavailable.
-            "available": True if prov in (None, "ollama") else bool(st.get(prov)),
+            # Auto always has something to try as long as any one key is set.
+            "available": bool(st.get(prov)) if prov else any(st.values()),
+            "default": key == DEFAULT_SELECTION_MODEL,
         })
     return out
 
@@ -243,7 +362,7 @@ def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None,
     """Run a single-prompt completion through the whole provider chain.
 
     Order is configurable via env CHAT_ORDER (comma list of
-    groq,gemini,openrouter,ollama). Returns the raw response text (caller parses
+    gemini,groq,openrouter). Returns the raw response text (caller parses
     it), or "" if every provider failed. `json_mode=True` asks for strict JSON.
 
     `prefer_model` is a key from SELECTION_MODELS. It moves that provider to the
@@ -257,10 +376,9 @@ def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None,
     if forced and forced[1]:
         models = [forced[1]] + [m for m in models if m != forced[1]]
     engines = {
-        "groq": lambda: _groq_chat(prompt, temperature, json_mode, models, log),
         "gemini": lambda: _gemini_chat(prompt, temperature, json_mode, log),
+        "groq": lambda: _groq_chat(prompt, temperature, json_mode, models, log),
         "openrouter": lambda: _openrouter_chat(prompt, temperature, json_mode, log),
-        "ollama": lambda: _ollama_chat(prompt, temperature, json_mode, log),
     }
     order_str = os.environ.get("CHAT_ORDER", DEFAULT_CHAT_ORDER)
     order = [o.strip().lower() for o in order_str.split(",") if o.strip()]
@@ -281,6 +399,47 @@ def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None,
             _say(log, f"    [chat] '{name}' unavailable -> trying '{order[i + 1]}'")
     _say(log, "    [chat] ALL chat providers failed (returning empty)")
     return ""
+
+
+# How much transcript one selection call may carry, per provider, in CHARACTERS.
+#
+# These are budgets for the FREE tiers, and the spread between them is the whole
+# reason long videos used to fail. Hindi tokenises at roughly 0.5 tokens/char on
+# Llama's tokenizer, so Groq's 12k tokens-per-minute ceiling is only ~22k characters
+# of Hindi per MINUTE — shared by every call. Gemini Flash has a million-token
+# context and a far larger per-minute allowance, so it swallows a feature-length
+# transcript whole and never needs splitting at all.
+CHAT_CHUNK_CHARS = {
+    "gemini":     240000,
+    "groq":         9000,
+    "openrouter":  24000,
+}
+DEFAULT_CHUNK_CHARS = 9000
+
+
+def chunk_chars_for(prefer_model=None):
+    """Characters of transcript to put in one selection call for this model choice.
+
+    SELECTION_CHUNK_CHARS overrides everything when set, so a paid tier can be dialled
+    in without touching code. "auto" is costed as the FIRST provider in the chain that
+    actually has a key — that is the one that will really answer, and sizing chunks for
+    a provider that never runs is how a long video ends up split 13 ways for nothing."""
+    override = (os.environ.get("SELECTION_CHUNK_CHARS") or "").strip()
+    if override:
+        try:
+            return max(1500, int(override))
+        except ValueError:
+            pass
+
+    key = (prefer_model or "auto").strip()
+    forced = dict(SELECTION_MODELS).get(key)
+    provider = forced[0] if forced else None
+    if not provider:
+        st = provider_status().get("chat", {})
+        order = [o.strip().lower() for o in
+                 os.environ.get("CHAT_ORDER", DEFAULT_CHAT_ORDER).split(",") if o.strip()]
+        provider = next((p for p in order if st.get(p)), None)
+    return CHAT_CHUNK_CHARS.get(provider, DEFAULT_CHUNK_CHARS)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -443,10 +602,16 @@ def transcribe_audio(audio_path, language="hi", log=None, prefer=None):
     """Word-level transcription with full provider fallback.
 
     Order is configurable via env TRANSCRIBE_ORDER (comma list of
-    groq,deepgram,local) or the `prefer` arg. Returns the normalised dict
+    deepgram,groq,local) or the `prefer` arg. Returns the normalised dict
     {"segments":[...]} of the first engine that succeeds, else None.
+
+    Deepgram leads because this transcript does double duty: it is what the clip
+    selector reads AND what the Hindi captions are timed from. nova-3 is markedly
+    better than Whisper on Hindi and on code-switched Hindi/English speech, so
+    putting it first improves the picks and the subtitles at the same time — and it
+    matches what the per-clip caption pass (CLIP_TRANSCRIBE_ORDER) already did.
     """
-    order_str = prefer or os.environ.get("TRANSCRIBE_ORDER", "groq,deepgram,local")
+    order_str = prefer or os.environ.get("TRANSCRIBE_ORDER", "deepgram,groq,local")
     order = [o.strip().lower() for o in order_str.split(",") if o.strip()]
     engines = {
         "groq": _groq_whisper_transcribe,
@@ -570,10 +735,12 @@ def provider_status():
             return False
 
     chat_providers = {
+        # Gemini is reached over plain REST, so the key is the ONLY requirement —
+        # there is no SDK left to be missing and no second way for this to read
+        # False while a working key sits in .env.
+        "gemini": _key("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         "groq": _key("GROQ_API_KEY"),
-        "gemini": _key("GEMINI_API_KEY", "GOOGLE_API_KEY") and _mod("google.generativeai"),
         "openrouter": _key("OPENROUTER_API_KEY"),
-        "ollama": False,   # probed lazily; treated as bonus, never required
     }
     transcribe_providers = {
         "groq": _key("GROQ_API_KEY"),

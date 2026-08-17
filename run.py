@@ -814,7 +814,7 @@ def _linux_make_shortcut():
         "Name=ShortsAI\n"
         "GenericName=Short-form video maker\n"
         "Comment=Turn long videos into vertical Shorts with AI captions\n"
-        f"Exec={sys.executable} {HERE / 'run.py'}\n"
+        f"Exec={sys.executable} {HERE / 'run.py'} --app\n"
         f"Path={HERE}\n"
         f"Icon={icon if icon.exists() else 'video-x-generic'}\n"
         "Terminal=true\n"
@@ -1024,6 +1024,8 @@ def main():
                     help="Skip API key and subtitle engine self-tests")
     ap.add_argument("--no-browser",     action="store_true",
                     help="Do not open the web UI in a browser on start")
+    ap.add_argument("--app",            action="store_true",
+                    help="Open in a desktop window instead of a browser tab")
     ap.add_argument("--shortcut",       action="store_true",
                     help="(Re)create the desktop / Start Menu shortcut and exit")
     ap.add_argument("--no-shortcut",    action="store_true",
@@ -1074,6 +1076,16 @@ def main():
         print()
         ok("Setup complete.  " + _reopen_hint(os_type))
         return
+
+    if args.app:
+        # Desktop window. Same server, same CPU work — only the viewport changes.
+        # Falls back to the browser by itself if no webview backend is installed.
+        hdr("Desktop window")
+        try:
+            import desktop
+            sys.exit(desktop.launch(args.port if args.port != 8000 else None, args.host))
+        except Exception as e:
+            warn(f"Desktop mode unavailable ({e}) — using the browser instead.")
 
     launch(args.host, args.port, args.reload, open_browser=not args.no_browser)
 

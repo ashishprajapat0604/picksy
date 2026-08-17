@@ -2396,7 +2396,7 @@ const icon = (id, size = 16, sw = 1.7) =>
    One object. Everything the backend needs comes out of getOptions(). */
 const S = {
   step: 0, preset: "custom",
-  src: "online", file: null, quality: "best",
+  src: "online", file: null, filePath: "", quality: "best",
   mode: "multi", lenMin: 20, lenMax: 40, count: 15, autoCount: true,
   partLen: 30, seriesTitle: "", partLabel: true,
   podStyle: "both", hostColor: "", guestColor: "",
@@ -2418,7 +2418,9 @@ const S = {
 
 const STEPS = [
   { id: "source",   t: "Source",        v: () => S.src === "online" ? ($("url").value.trim() ? "Link ready" : "No link yet")
-                                                                    : (S.file ? S.file.name : "No file chosen") },
+                                                                    : (S.file ? S.file.name
+                                                                       : (S.filePath ? S.filePath.split(/[\\/]/).pop()
+                                                                                     : "No file chosen")) },
   { id: "clips",    t: "Cutting",       v: () => (S.mode === "sequential"
                                                   ? `Parts of ${S.partLen}s`
                                                   : `${MODE_NAME[S.mode]}, ${S.lenMin}–${S.lenMax}s`)
@@ -2534,8 +2536,62 @@ $("file").addEventListener("change", (e) => setFile(e.target.files[0]));
   e.preventDefault(); drop.dataset.over = "0";
 }));
 drop.addEventListener("drop", (e) => setFile(e.dataTransfer.files[0]));
+/* Running inside the desktop window? Then a native picker is available and the
+   file never has to be uploaded — the backend reads it where it already is. */
+const isDesktop = () => typeof window.pywebview !== "undefined" && !!window.pywebview.api;
+
+let desktopReady = false;
+function enableDesktop() {
+  if (desktopReady || !isDesktop()) return;
+  desktopReady = true;
+  document.documentElement.dataset.desktop = "1";
+  const dz = $("drop");
+  if (dz) {
+    const lbl = dz.querySelector(".hint, .sub, p");
+    if (lbl) lbl.textContent = "Click to choose a video from this computer";
+    dz.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation(); pickNative();
+    }, true);
+  }
+}
+
+async function pickNative() {
+  try {
+    const path = await window.pywebview.api.pick_video();
+    if (path) setLocalPath(path);
+  } catch (e) { /* cancelled */ }
+}
+
+function setLocalPath(path) {
+  S.filePath = path;
+  S.file = null;
+  // A picked file implies the local source — otherwise the URL tab stays active
+  // and Generate remains disabled with a file visibly chosen.
+  S.src = "local";
+  press("srcMode", "local");
+  $("srcOnline").hidden = true;
+  $("srcLocal").hidden = false;
+  $("qualityField").hidden = true;
+  const name = path.split(/[\\/]/).pop();
+  const chip = $("fileChip");
+  chip.hidden = false;
+  chip.textContent = "";
+  const c = el("div", "filechip");
+  const mid = el("div");
+  mid.append(el("div", "n", name), el("div", "s", "on this computer"));
+  const x = el("button", "x");
+  x.type = "button";
+  x.innerHTML = icon("i-x", 15);
+  x.setAttribute("aria-label", "Remove file");
+  x.addEventListener("click", () => { S.filePath = ""; chip.hidden = true; sync(); });
+  c.append(mid, x);
+  chip.appendChild(c);
+  sync();
+}
+
 function setFile(f) {
   if (!f) return;
+  S.filePath = "";
   S.file = f;
   const chip = $("fileChip");
   chip.hidden = false;
@@ -3407,7 +3463,8 @@ function sync() {
   $("logoSolider").disabled = S.logoOpacity >= .999;
 
   // Generate
-  const ready = S.src === "online" ? !!$("url").value.trim() : !!S.file;
+  const ready = S.src === "online" ? !!$("url").value.trim()
+                                  : (!!S.file || !!S.filePath);
   $("genBtn").disabled = !ready || S.busy;
   $("genHint").textContent = S.busy ? "Working…"
     : ready ? "" : (S.src === "online" ? "Paste a link to begin" : "Choose a video to begin");
@@ -3420,7 +3477,7 @@ function renderSummary() {
   const n = $("summary");
   n.textContent = "";
   const lines = [
-    S.src === "online" ? "From a link" : `From ${S.file ? S.file.name : "a file"}`,
+    S.src === "online" ? "From a link" : `From ${S.file ? S.file.name : (S.filePath ? S.filePath.split(/[\\/]/).pop() : "a file")}`,
     S.mode === "sequential"
       ? `Split into ${secLabel(S.partLen)} parts`
       : `${MODE_NAME[S.mode]}, each ${secLabel(S.lenMin)}–${secLabel(S.lenMax)}` +
@@ -3515,6 +3572,19 @@ async function run() {
         body: JSON.stringify({ url: $("url").value.trim(), options: getOptions() }),
       });
     } else {
+      if (S.filePath) {
+        // Desktop: hand over the path. Nothing is copied, so a 2GB source starts
+        // processing immediately instead of after an upload.
+        r = await fetch("/process/local", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: S.filePath, options: getOptions() }),
+        });
+        const dd = await r.json();
+        if (!r.ok) throw new Error(dd.detail || "Could not start the job");
+        S.jobId = dd.job_id;
+        poll();
+        return;
+      }
       const fd = new FormData();
       fd.append("file", S.file);
       fd.append("options", JSON.stringify(getOptions()));
@@ -3854,6 +3924,11 @@ $("keySave").addEventListener("click", async () => {
   titleFields();
   fitHelp();
   applyMode();
+  // pywebview injects its API asynchronously and announces it with
+  // `pywebviewready`; checking at boot is too early and silently skips setup.
+  // Both paths are covered because the event may already have fired.
+  window.addEventListener("pywebviewready", enableDesktop);
+  if (isDesktop()) enableDesktop();
   paintPresets();
   loadStatus();
   goto(0);

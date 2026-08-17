@@ -49,6 +49,36 @@ Shortcut missing or the folder moved? Rebuild it:
 python3 run.py --shortcut
 ```
 
+### Desktop app or browser?
+
+```bash
+python3 run.py --app     # native window
+python3 run.py           # browser tab
+```
+
+The shortcut uses `--app`, so clicking **Piksy** opens a real window with its own
+taskbar entry and no address bar.
+
+**This changes the window, not the work.** All the processing — ffmpeg,
+transcription, clip selection — has always run as Python on your machine; the
+browser was only ever a viewport onto `localhost`. Nothing gets faster or more
+local by switching. What you do gain:
+
+- a native **file picker** — a 2 GB source is read where it sits instead of being
+  copied through an HTTP upload into `uploads/`
+- closing the window stops the server (no orphaned process holding the port)
+- no browser tab, no address bar, its own icon
+
+Windows and macOS get their webview automatically. Linux needs a system package:
+
+```bash
+sudo dnf install python3-gobject webkit2gtk4.1      # Fedora
+sudo apt install python3-gi gir1.2-webkit2-4.1      # Debian/Ubuntu
+```
+
+Without one, `--app` says so and opens the browser instead — a missing GUI
+toolkit costs you the window, not the app.
+
 ### Already have the repo?
 
 ```bash
@@ -68,6 +98,7 @@ That single command sets up anything missing and starts the app. Re-run it any t
 | `--skip-fonts` | Skip font downloads on re-runs |
 | `--shortcut` | Rebuild the desktop / Start Menu shortcut and exit |
 | `--no-shortcut` | Don't create a shortcut |
+| `--app` | Open in a native desktop window instead of a browser tab |
 
 ---
 

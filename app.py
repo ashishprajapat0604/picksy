@@ -639,6 +639,49 @@ def delete_job(job_id: str, keep_files: bool = False):
             "message": "Job removed." if not keep_files else "Job forgotten (files kept on disk)."}
 
 
+class LocalVideoRequest(BaseModel):
+    path: str
+    options: Optional[dict] = None
+
+
+_VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"}
+
+
+@app.post("/process/local", response_model=JobResponse)
+def process_from_local_path(payload: LocalVideoRequest, request: Request):
+    """Run the pipeline on a file ALREADY on this machine, by path.
+
+    The desktop window's native file picker uses this instead of /process/upload:
+    a 2 GB source would otherwise be copied through an HTTP POST into uploads/ just
+    to hand ffmpeg a path it could have read directly. Nothing is copied here.
+
+    Guarded to this machine for the same reason the settings endpoint is — with
+    --host 0.0.0.0 it would otherwise let the network name any file on disk.
+    """
+    _require_local(request)
+
+    raw = (payload.path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="No file path given.")
+    path = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail=f"No such file: {path}")
+    if os.path.splitext(path)[1].lower() not in _VIDEO_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not a video file: {os.path.basename(path)}")
+
+    job_id = str(uuid4())
+    options = _apply_logo_option(payload.options)
+    # No uploaded_path: the file is the user's own and must NEVER be deleted when
+    # the job is removed. /process/upload owns its copy; this does not own this.
+    _set_job(job_id, status="queued", message="Job queued", source=path)
+
+    threading.Thread(target=_run_full_pipeline,
+                     args=(job_id, None, path, options), daemon=True).start()
+    return JobResponse(job_id=job_id, status="queued")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

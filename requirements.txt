@@ -42,3 +42,14 @@ psutil>=5.9
 #   • A Devanagari font  (e.g. NotoSansDevanagari-Bold.ttf) for Hindi / dual
 #                         captions — place it under ./fonts/  (see README)
 # ─────────────────────────────────────────────────────────────
+
+# ── Desktop window ────────────────────────────────────────────────────────────
+# Runs the same local server inside a native window instead of a browser tab.
+# It brings its own backend on Windows (pythonnet -> WebView2, already part of
+# Edge) and macOS (pyobjc -> WKWebView). LINUX is the exception: the GTK bindings
+# are a system package pip cannot supply —
+#     Fedora        sudo dnf install python3-gobject webkit2gtk4.1
+#     Debian/Ubuntu sudo apt install python3-gi gir1.2-webkit2-4.1
+# Without a backend the app opens in the browser instead of failing, so this
+# dependency is genuinely optional.
+pywebview>=5,<7

@@ -1,16 +1,16 @@
 @echo off
-rem ShortsAI - double-click launcher for Windows.
+rem Piksy - double-click launcher for Windows.
 rem The Start Menu / Desktop shortcut points here. Safe to run directly too.
 
 cd /d "%~dp0"
-title ShortsAI
+title Piksy
 
 echo.
-echo   ShortsAI is starting...
-echo   Your browser will open by itself in a moment.
+echo   Piksy is starting...
+echo   The Piksy window will open in a moment.
 echo.
-echo   KEEP THIS WINDOW OPEN while you use ShortsAI.
-echo   Closing it (or pressing Ctrl+C) stops the app.
+echo   This black window is just the engine - you can ignore it.
+echo   Closing the Piksy window stops everything.
 echo.
 
 rem Prefer the project's own virtualenv; fall back to a system Python.
@@ -36,13 +36,13 @@ if not defined PY (
     exit /b 1
 )
 
-"%PY%" run.py %*
+"%PY%" run.py --app %*
 set "RC=%ERRORLEVEL%"
 
 rem On a crash the window would vanish before the error could be read - hold it open.
 if not "%RC%"=="0" (
     echo.
-    echo   ShortsAI exited with an error ^(code %RC%^).
+    echo   Piksy exited with an error ^(code %RC%^).
     echo   Scroll up to see what went wrong.
     echo.
     pause

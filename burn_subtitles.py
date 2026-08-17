@@ -672,6 +672,14 @@ def _sz(px: int, frame: tuple) -> int:
 
 
 # Visual tuning (real pixels on the 1080x1920 frame)
+# Caption size is a MULTIPLIER, not an absolute point size: every style preset
+# carries its own size (bold_yellow is bigger than outline by design), so a fixed
+# number would flatten those differences. Scaling preserves the style's proportions
+# while still letting the user make everything bigger or smaller.
+CAPTION_SIZE_MIN = 0.6
+CAPTION_SIZE_MAX = 1.8
+CAPTION_SIZE_DEFAULT = 1.0
+
 _HI_FONTSIZE    = 60
 _TITLE_FONTSIZE = 64
 _PART_FONTSIZE  = 58          # "Part 3" badge (sequential mode)
@@ -1236,7 +1244,11 @@ def make_caption_ass(segments: list, ass_path: str,
                      caption_xy=None,
                      title_xy=None,
                      part_xy=None,
-                     speaker_colours=None) -> tuple:
+                     speaker_colours=None,
+                     caption_size: float = CAPTION_SIZE_DEFAULT,
+                     caption_xy_en=None,
+                     position_hi: str = "",
+                     position_en: str = "") -> tuple:
     """Write ONE ASS file on a 1080x1920 frame.
 
     layout == "single": ONE caption track in `language`, pinned to `position`, styled
@@ -1295,6 +1307,15 @@ def make_caption_ass(segments: list, ass_path: str,
         if who is None:
             return ""
         return _inline_colour(spk_colours.get(who, ""))
+
+    try:
+        csize = max(CAPTION_SIZE_MIN, min(CAPTION_SIZE_MAX, float(caption_size)))
+    except (TypeError, ValueError):
+        csize = CAPTION_SIZE_DEFAULT
+
+    def _cap(px):
+        """A caption font size with the user's multiplier applied."""
+        return max(10, int(round(px * csize)))
 
     cap_xy = _norm_xy(caption_xy)
     ttl_xy = _norm_xy(title_xy)
@@ -1367,17 +1388,38 @@ def make_caption_ass(segments: list, ass_path: str,
                                    dual_words)
         # Dragging the caption moves the PAIR: the Hindi line sits at the chosen
         # point and the English line tucks just beneath it, keeping the stacked look.
+        # The two tracks are positioned INDEPENDENTLY: a dragged point or a preset
+        # for each. Falling back, the classic stacked look is preserved — Hindi up
+        # top, English underneath — so a job that never touches these looks the same
+        # as it always did.
+        en_xy = _norm_xy(caption_xy_en)
+        p_hi = position_hi if position_hi in _POS_ALIGN else ""
+        p_en = position_en if position_en in _POS_ALIGN else ""
+
         if cap_xy:
-            hi_y = cap_xy[1]
-            en_y = min(0.98, hi_y + _DUAL_GAP_FRAC)
-            styles.append(_style_row("HI", hindi_font, dpreset, 5, 0, fontsize=_HI_FONTSIZE, frame=F))
-            styles.append(_style_row("EN", latin_font, dpreset, 5, 0, fontsize=_EN_FONTSIZE, frame=F))
-            hi_prefix = _pos_tag((cap_xy[0], hi_y), F)
-            en_prefix = _pos_tag((cap_xy[0], en_y), F)
+            hi_align, hi_mv, hi_prefix = 5, 0, _pos_tag(cap_xy, F)
+        elif p_hi:
+            hi_align, hi_mv = _position_layout(p_hi, video_box, F)
+            hi_prefix = ""
         else:
-            styles.append(_style_row("HI", hindi_font, dpreset, 8, _sz(90, F), fontsize=_HI_FONTSIZE, frame=F))
-            styles.append(_style_row("EN", latin_font, dpreset, 2, _sz(150, F), fontsize=_EN_FONTSIZE, frame=F))
-            hi_prefix = en_prefix = ""
+            hi_align, hi_mv, hi_prefix = 8, _sz(90, F), ""
+
+        if en_xy:
+            en_align, en_mv, en_prefix = 5, 0, _pos_tag(en_xy, F)
+        elif p_en:
+            en_align, en_mv = _position_layout(p_en, video_box, F)
+            en_prefix = ""
+        elif cap_xy:
+            # Only the pair was dragged — keep English tucked under Hindi.
+            en_align, en_mv = 5, 0
+            en_prefix = _pos_tag((cap_xy[0], min(0.98, cap_xy[1] + _DUAL_GAP_FRAC)), F)
+        else:
+            en_align, en_mv, en_prefix = 2, _sz(150, F), ""
+
+        styles.append(_style_row("HI", hindi_font, dpreset, hi_align, hi_mv,
+                                 fontsize=_cap(_HI_FONTSIZE), frame=F))
+        styles.append(_style_row("EN", latin_font, dpreset, en_align, en_mv,
+                                 fontsize=_cap(_EN_FONTSIZE), frame=F))
         has_title = False
         if show_title and title:
             if ttl_xy:
@@ -1407,11 +1449,13 @@ def make_caption_ass(segments: list, ass_path: str,
         font = hindi_font if language == "hindi" else latin_font
         if cap_xy:
             # Free placement: centre-anchored style, exact \pos per line.
-            styles.append(_style_row("SUB", font, preset, 5, 0, frame=F))
+            styles.append(_style_row("SUB", font, preset, 5, 0,
+                                     fontsize=_cap(preset["fontsize"]), frame=F))
             cap_prefix = _pos_tag(cap_xy, F)
         else:
             sub_align, sub_mv = _position_layout(position, video_box, F)
-            styles.append(_style_row("SUB", font, preset, sub_align, sub_mv, frame=F))
+            styles.append(_style_row("SUB", font, preset, sub_align, sub_mv,
+                                     fontsize=_cap(preset["fontsize"]), frame=F))
             cap_prefix = ""
 
         if preset["anim"] == "karaoke":
@@ -1825,6 +1869,10 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                              title_xy=None,
                              part_xy=None,
                              speaker_colours=None,
+                             caption_size: float = CAPTION_SIZE_DEFAULT,
+                             caption_xy_en=None,
+                             position_hi: str = "",
+                             position_en: str = "",
                              hook_start: float = None,
                              hook_end: float = None,
                              logo: dict = None) -> str:
@@ -2042,6 +2090,10 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                     title_xy=title_xy,
                     part_xy=part_xy,
                     speaker_colours=speaker_colours,
+                    caption_size=caption_size,
+                    caption_xy_en=caption_xy_en,
+                    position_hi=position_hi,
+                    position_en=position_en,
                 )
                 log.log(f"     Tracks : {primary} primary cues / {secondary} secondary cues / "
                         f"title={'yes' if has_title else 'no'} (fontsdir={fontsdir or 'system'})")
@@ -2254,6 +2306,19 @@ def execute_subtitle_workflow(
             if _roles.get("guest") is not None and _guest_hex:
                 speaker_colours[_roles["guest"]] = _hex_to_ass(_guest_hex)
 
+        # Caption size multiplier, and the dual layout's independent positions.
+        try:
+            caption_size = float(cfg.get("caption_size", CAPTION_SIZE_DEFAULT))
+        except (TypeError, ValueError):
+            caption_size = CAPTION_SIZE_DEFAULT
+        position_hi = str(cfg.get("subtitle_position_hi", "") or "").lower()
+        position_en = str(cfg.get("subtitle_position_en", "") or "").lower()
+        if position_hi not in ("top", "middle", "bottom", "below"):
+            position_hi = ""
+        if position_en not in ("top", "middle", "bottom", "below"):
+            position_en = ""
+        caption_xy_en = _norm_xy(cfg.get("caption_xy_en"))
+
         caption_xy = _norm_xy(cfg.get("caption_xy"))
         title_xy   = _norm_xy(cfg.get("title_xy"))
         part_xy    = _norm_xy(cfg.get("part_xy"))
@@ -2309,7 +2374,10 @@ def execute_subtitle_workflow(
 
         log.section("CAPTION CONFIG")
         log.log(f"   burn={burn} | layout={layout} | language={language} | position={position} | "
-                f"style={caption_style} | title={show_title}")
+                f"style={caption_style} | size=x{caption_size:.2f} | title={show_title}")
+        if layout == "dual" and (position_hi or position_en or caption_xy_en):
+            log.log(f"   dual positions: hindi={position_hi or 'default'} "
+                    f"english={position_en or 'default'}")
         log.log(f"   text={caption_color or 'style default'} | "
                 f"highlight={accent_color or 'default'} | "
                 f"words on screen={words_on_screen}"
@@ -2598,6 +2666,10 @@ def execute_subtitle_workflow(
                 title_xy=title_xy,
                 part_xy=part_xy,
                 speaker_colours=speaker_colours,
+                caption_size=caption_size,
+                caption_xy_en=caption_xy_en,
+                position_hi=position_hi,
+                position_en=position_en,
                 # Hook-first cold open, chosen during selection. None for clips that
                 # were too short for one, and for every sequential part.
                 hook_start=rc.get("hook_start") if hook_first else None,

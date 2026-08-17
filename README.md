@@ -201,6 +201,8 @@ pip install faster-whisper          # offline transcription, never rate-limited
 | Layout | `single` · `dual` (Hindi ↑ / English ↓) | single |
 | Language | `hindi` · `english` · `hinglish` | hindi |
 | Position | `top` · `middle` · `bottom` · `below`, or **drag anywhere** | bottom |
+| Position *(dual)* | Hindi and English placed **independently** | classic stack |
+| Caption size | 60%–180% of the style's own size | 100% |
 | Caption look | outline · box · white_box · bold_yellow · karaoke · neon · retro · shadow · fire · fade | outline |
 | Fonts | 8 Devanagari · 10 Latin | Noto / Poppins |
 | AI title line | on / off | off |

@@ -2125,6 +2125,48 @@ dialog::backdrop{
             <p class="help">Or drag the caption anywhere on the preview. Dragging wins over this.</p>
           </div>
 
+          <!-- Dual layout only: the two tracks are placed independently. -->
+          <div class="field" id="posDualField" hidden>
+            <span class="lbl">Position — each track separately</span>
+            <div class="spk-row">
+              <span class="spk-lbl">हिन्दी</span>
+              <div class="seg" id="posHi" role="group" aria-label="Hindi caption position">
+                <button type="button" data-v="" aria-pressed="true">Default</button>
+                <button type="button" data-v="top" aria-pressed="false">Top</button>
+                <button type="button" data-v="middle" aria-pressed="false">Middle</button>
+                <button type="button" data-v="bottom" aria-pressed="false">Bottom</button>
+                <button type="button" data-v="below" aria-pressed="false">Under</button>
+              </div>
+            </div>
+            <div class="spk-row">
+              <span class="spk-lbl">English</span>
+              <div class="seg" id="posEn" role="group" aria-label="English caption position">
+                <button type="button" data-v="" aria-pressed="true">Default</button>
+                <button type="button" data-v="top" aria-pressed="false">Top</button>
+                <button type="button" data-v="middle" aria-pressed="false">Middle</button>
+                <button type="button" data-v="bottom" aria-pressed="false">Bottom</button>
+                <button type="button" data-v="below" aria-pressed="false">Under</button>
+              </div>
+            </div>
+            <p class="help">“Default” keeps the classic stack — Hindi on top, English beneath.
+              You can also drag each line on the preview independently.</p>
+          </div>
+
+          <div class="field row" id="capSizeField">
+            <span class="lbl" style="margin:0">Caption size</span>
+            <div class="stepper">
+              <button type="button" id="capSmaller" aria-label="Smaller captions">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.2" stroke-linecap="round"><use href="#i-minus"/></svg></button>
+              <span class="val" id="capSizeVal">100%</span>
+              <button type="button" id="capBigger" aria-label="Bigger captions">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.2" stroke-linecap="round"><use href="#i-plus"/></svg></button>
+            </div>
+            <p class="help" style="flex-basis:100%">Scales whichever style you pick, so a bold style
+              stays bolder than a plain one. 60%–180%.</p>
+          </div>
+
           <div class="field">
             <span class="lbl">Style</span>
             <div class="grid" id="styles"></div>
@@ -2307,6 +2349,7 @@ dialog::backdrop{
       <div class="canvas" id="canvas">
         <div class="video"></div>
         <div class="ov" id="pvCap"></div>
+        <div class="ov" id="pvCap2" hidden></div>
         <div class="ov" id="pvTitle" hidden></div>
         <div class="ov" id="pvPart" hidden></div>
         <!-- The image element is created once a logo exists. Shipping one with no
@@ -2359,6 +2402,7 @@ const S = {
   podStyle: "both", hostColor: "", guestColor: "",
   burn: true, layout: "single", lang: "hindi", pos: "bottom",
   style: "outline", accent: "#66BB6A", capColor: "", words: 0,
+  capSize: 1.0, posHi: "", posEn: "",
   hindiFont: "", latinFont: "",
   showTitle: false, council: true, kit: true,
   aspect: "9:16", fit: "fit", model: "auto",
@@ -2367,7 +2411,7 @@ const S = {
   piksyMark: true,
   // Drag placement. null = use the preset position. Fractions of the 1080x1920
   // frame, centre-anchored — exactly what the ASS \pos() tag takes.
-  xy: { cap: null, title: null, part: null, logo: null },
+  xy: { cap: null, capEn: null, title: null, part: null, logo: null },
   jobId: null, shown: new Set(), busy: false, styles: [], models: [], aspects: [],
   fonts: { hindi: [], english: [] },
 };
@@ -2392,6 +2436,7 @@ const MODE_NAME = { multi: "Many clips", best: "Best only", hook: "Hook first",
 const LANG_NAME = { hindi: "हिन्दी", english: "English", hinglish: "Hinglish" };
 const PART_LENS = [15, 20, 30, 45, 60, 90, 120, 180, 300];
 const CLIP_LENS = [7, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 75, 90];
+const CAP_SIZES = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8];
 // "" = keep whatever colour the chosen style ships with.
 const CAP_COLORS = ["", "#FFFFFF", "#E8F5E9", "#A5D6A7", "#66BB6A", "#008170", "#1B5E20",
                     "#000000", "#FFE600"];
@@ -2653,6 +2698,7 @@ toggle("burn", "burn", () => { $("capOnly").hidden = !S.burn; markCustom(); rend
 group("layout", (v) => {
   S.layout = v;
   $("langField").hidden = v === "dual";
+  captionFields();
   markCustom();
   refreshStyles();
   renderPreview();
@@ -2661,6 +2707,12 @@ group("layout", (v) => {
 group("lang", (v) => { S.lang = v; refreshStyles(); renderPreview(); sync(); });
 group("pos", (v) => { S.pos = v; S.xy.cap = null; markCustom(); renderPreview(); sync(); });
 group("words", (v) => { S.words = +v; captionFields(); markCustom(); renderPreview(); sync(); });
+group("posHi", (v) => { S.posHi = v; S.xy.cap = null; markCustom(); renderPreview(); sync(); });
+group("posEn", (v) => { S.posEn = v; S.xy.capEn = null; markCustom(); renderPreview(); sync(); });
+stepper("capSmaller", "capBigger",
+  () => CAP_SIZES.indexOf(S.capSize),
+  (i) => { S.capSize = CAP_SIZES[clamp(i, 0, CAP_SIZES.length - 1)];
+           markCustom(); captionFields(); });
 group("aspect", (v) => { S.aspect = v; markCustom(); renderPreview(); sync(); });
 group("fit", (v) => { S.fit = v; fitHelp(); markCustom(); renderPreview(); sync(); });
 
@@ -2935,6 +2987,16 @@ buildSwatches("guestSwatches", CAP_COLORS, "guestColor", "Guest caption colour")
 /* Which caption colour controls apply to the style that is currently chosen,
    and what the words-on-screen setting actually resolves to. */
 function captionFields() {
+  // Dual places two tracks, so the single Position control is replaced by the pair.
+  const dual = S.layout === "dual";
+  const pf = $("posField"), pdf = $("posDualField");
+  if (pf) pf.hidden = dual;
+  if (pdf) pdf.hidden = !dual;
+  const csv = $("capSizeVal");
+  if (csv) csv.textContent = Math.round(S.capSize * 100) + "%";
+  const i = CAP_SIZES.indexOf(S.capSize);
+  if ($("capSmaller")) $("capSmaller").disabled = i <= 0;
+  if ($("capBigger")) $("capBigger").disabled = i >= CAP_SIZES.length - 1;
   const animated = S.style === "karaoke" || S.style === "word_pop";
   $("accentField").hidden = !animated;
   const n = wordsOnScreen();
@@ -3012,9 +3074,12 @@ $("logoSolider").addEventListener("click", () => { S.logoOpacity = clamp(S.logoO
    The 9:16 stage. Every overlay is draggable; dropping one pins it and overrides
    the preset position for that overlay only. */
 const POS_Y = { top: .12, middle: .5, bottom: .84, below: .93 };
+// Where the classic stacked pair sits when neither track has been placed.
+const DUAL_HI_Y = .16, DUAL_EN_Y = .88;
 
 function renderPreview() {
-  const cap = $("pvCap"), title = $("pvTitle"), part = $("pvPart"), logo = $("pvLogo");
+  const cap = $("pvCap"), cap2 = $("pvCap2"), title = $("pvTitle"),
+        part = $("pvPart"), logo = $("pvLogo");
   const cv = $("canvas");
   const [FW, FH] = ASPECT_PX[S.aspect] || ASPECT_PX["9:16"];
 
@@ -3068,7 +3133,7 @@ function renderPreview() {
       ? (S.fonts.hindi.find((f) => f.key === S.hindiFont) || {}).family
       : (S.fonts.english.find((f) => f.key === S.latinFont) || {}).family;
     cap.style.fontFamily = family ? `"${family}", system-ui` : "system-ui";
-    cap.style.fontSize = px(S.style === "word_pop" ? 76 : 58);
+    cap.style.fontSize = px((S.style === "word_pop" ? 76 : 58) * S.capSize);
     cap.style.color = "";
     // Show exactly as many words as the renderer will put on screen, and paint
     // them the colours it will use. A preview that shows three words while
@@ -3079,15 +3144,22 @@ function renderPreview() {
     // can see the highlight sitting among neighbours rather than alone.
     const hot = Math.min(1, shown.length - 1);
     if (S.layout === "dual") {
-      cap.innerHTML = "";
-      const hi = el("div", "cs-outline", shown.join(" "));
-      const en = el("div", "cs-outline",
-        SAMPLE.english.split(" ").slice(0, n).join(" "));
-      en.style.fontSize = ".78em";
-      en.style.marginTop = ".18em";
-      if (S.capColor) { hi.style.color = S.capColor; en.style.color = S.capColor; }
-      cap.append(hi, en);
+      // The two tracks are separate nodes so each can be positioned — and dragged —
+      // on its own, exactly as the renderer places them.
+      cap.className = "ov cs-outline";
+      cap.textContent = shown.join(" ");
+      if (S.capColor) cap.style.color = S.capColor;
+      cap2.hidden = false;
+      cap2.className = "ov cs-outline";
+      cap2.textContent = SAMPLE.english.split(" ").slice(0, n).join(" ");
+      cap2.style.fontFamily = (S.fonts.english.find((f) => f.key === S.latinFont) || {}).family
+        ? `"${(S.fonts.english.find((f) => f.key === S.latinFont) || {}).family}", system-ui`
+        : "system-ui";
+      cap2.style.fontSize = px(54 * S.capSize);
+      cap2.style.color = S.capColor || "";
+      place(cap2, S.xy.capEn || { x: .5, y: S.posEn ? POS_Y[S.posEn] : DUAL_EN_Y });
     } else {
+      cap2.hidden = true;
       cap.className = "ov cs-" + S.style;
       if (S.capColor) cap.style.color = S.capColor;
       // The playback driver owns the text from here: it paints each cue on a
@@ -3106,7 +3178,8 @@ function renderPreview() {
         }
       }
     }
-    place(cap, S.xy.cap || { x: .5, y: POS_Y[S.pos] });
+    place(cap, S.xy.cap || { x: .5, y: S.layout === "dual"
+      ? (S.posHi ? POS_Y[S.posHi] : DUAL_HI_Y) : POS_Y[S.pos] });
   }
   syncCaptionPlayback(cap);
 
@@ -3266,7 +3339,8 @@ if (window.ResizeObserver) {
   new ResizeObserver(() => renderPreview()).observe($("canvas").parentElement);
 }
 
-[["pvCap", "cap"], ["pvTitle", "title"], ["pvPart", "part"], ["pvLogo", "logo"]].forEach(([id, key]) => {
+[["pvCap", "cap"], ["pvCap2", "capEn"], ["pvTitle", "title"],
+ ["pvPart", "part"], ["pvLogo", "logo"]].forEach(([id, key]) => {
   const node = $(id);
   node.addEventListener("pointerdown", (e) => {
     e.preventDefault();
@@ -3387,6 +3461,10 @@ function getOptions() {
     caption_accent: (S.style === "karaoke" || S.style === "word_pop") ? S.accent : "",
     caption_color: S.capColor,
     caption_words: S.words,
+    caption_size: S.capSize,
+    subtitle_position_hi: S.posHi,
+    subtitle_position_en: S.posEn,
+    caption_xy_en: S.xy.capEn,
     aspect: S.aspect,
     fit: S.fit,
     selection_model: S.model,

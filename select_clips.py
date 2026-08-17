@@ -1663,6 +1663,10 @@ def execute_selection_workflow(
     options.setdefault("caption_style", "outline")          # outline|box|white_box|bold_yellow|karaoke|word_pop
     options.setdefault("caption_accent", "")                # '#RRGGBB' highlight for the karaoke/word_pop active word
     options.setdefault("caption_color", "")                 # '#RRGGBB' caption text colour ('' = the style's own)
+    options.setdefault("caption_size", 1.0)                 # font-size multiplier (0.6-1.8)
+    options.setdefault("subtitle_position_hi", "")           # dual layout: Hindi track ('' = classic top)
+    options.setdefault("subtitle_position_en", "")           # dual layout: English track ('' = classic bottom)
+    options.setdefault("caption_xy_en", None)                # dual layout: dragged English position
     options.setdefault("caption_words", 0)                  # words on screen at once (1-8; 0 = per-style default)
     options.setdefault("title_font", "")                    # English-font key for the AI headline ("" = same as captions)
     options.setdefault("title_style", "")                   # caption-style key for the headline ("" = the original yellow caps)
@@ -1930,6 +1934,10 @@ def execute_selection_workflow(
                 "host_color":        options.get("host_color", ""),
                 "piksy_watermark":   bool(options.get("piksy_watermark", True)),
                 "guest_color":       options.get("guest_color", ""),
+                "caption_size":      options.get("caption_size", 1.0),
+                "subtitle_position_hi": options.get("subtitle_position_hi", ""),
+                "subtitle_position_en": options.get("subtitle_position_en", ""),
+                "caption_xy_en":     options.get("caption_xy_en"),
                 "caption_xy":        options.get("caption_xy"),
                 "title_xy":          options.get("title_xy"),
                 "part_xy":           options.get("part_xy"),

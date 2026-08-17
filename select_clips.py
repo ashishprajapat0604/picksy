@@ -390,9 +390,75 @@ def _ends_a_sentence(text: str) -> bool:
     return bool(text) and text[-1] in _SENTENCE_END_CHARS
 
 
+def split_into_sentences(segments: list, log: DiagnosticLog = None) -> list:
+    """Re-cut segments so each one is a single sentence.
+
+    Some ASR providers hand back the entire video as ONE segment (Deepgram nova-3
+    does this routinely — 150s of speech, 689 words, one entry). Sentence snapping
+    then has no boundaries to snap to, and every clip gets cut wherever the clock
+    lands, mid-thought. The punctuation IS there, just inside the text.
+
+    Word timings let us recover the real boundaries: walk the words, and close a
+    segment each time one ends with sentence punctuation. Segments without word
+    timings are passed through untouched.
+    """
+    if not segments:
+        return segments
+
+    out = []
+    for seg in segments:
+        words = [w for w in (seg.get("words") or [])
+                 if (w.get("word") or "").strip()
+                 and w.get("start") is not None and w.get("end") is not None]
+        # Nothing to split on, or already a single sentence — keep as-is.
+        if not words or len(words) < 2:
+            out.append(seg)
+            continue
+
+        bucket = []
+        for w in words:
+            bucket.append(w)
+            if _ends_a_sentence(w.get("word", "")):
+                out.append({
+                    "start": bucket[0]["start"],
+                    "end": bucket[-1]["end"],
+                    "text": " ".join((b.get("word") or "").strip() for b in bucket).strip(),
+                    "words": list(bucket),
+                })
+                bucket = []
+        if bucket:
+            # Trailing words with no closing punctuation still belong to the video.
+            out.append({
+                "start": bucket[0]["start"],
+                "end": bucket[-1]["end"],
+                "text": " ".join((b.get("word") or "").strip() for b in bucket).strip(),
+                "words": list(bucket),
+            })
+
+    if log is not None and len(out) != len(segments):
+        complete = sum(1 for s in out if _ends_a_sentence(s.get("text", "")))
+        log.log(f"  Sentence split: {len(segments)} segment(s) -> {len(out)} "
+                f"({complete} end on punctuation) — clips can now cut on real boundaries")
+    return out
+
+
+def _complete_window(segments: list, idx: int, min_dur: float, max_dur: float):
+    """Given a start segment index, return the latest end inside [min_dur, max_dur]
+    that lands on sentence-ending punctuation — or None if there isn't one."""
+    clip_start = segments[idx]["start"]
+    best = None
+    for seg in segments[idx:]:
+        if seg["end"] - clip_start > max_dur:
+            break
+        if seg["end"] - clip_start >= min_dur and _ends_a_sentence(seg.get("text", "")):
+            best = seg["end"]
+    return best
+
+
 def snap_to_sentence_boundaries(raw_start: float, raw_end: float, segments: list,
                                  min_dur: float = DEFAULT_MIN_CLIP_LEN,
-                                 max_dur: float = DEFAULT_MAX_CLIP_LEN) -> tuple:
+                                 max_dur: float = DEFAULT_MAX_CLIP_LEN,
+                                 require_complete: bool = False) -> tuple:
     """Snap a raw [start, end] window so the clip begins at the start of a spoken
     thought and ends on a COMPLETE sentence (never mid-context).
 
@@ -403,12 +469,43 @@ def snap_to_sentence_boundaries(raw_start: float, raw_end: float, segments: list
         sentence-ending punctuation. Only if no punctuated end exists do we fall
         back to a plain segment boundary. This is what stops clips being cut in the
         middle of a sentence.
+
+    require_complete=True makes that guarantee absolute instead of best-effort: the
+    clip MUST open a sentence and MUST close one. Rather than overshooting max_dur
+    to find punctuation (which would break the promised length), it slides the START
+    forward through later sentence openings until a complete window fits the bounds.
+    Returns (None, None) when no such window exists, so the caller drops the pick
+    instead of shipping a clip that stops mid-thought.
     """
     if not segments:
-        return raw_start, raw_end
+        return (None, None) if require_complete else (raw_start, raw_end)
 
     # --- choose a start that ideally opens a fresh sentence ---
     idx = min(range(len(segments)), key=lambda i: abs(segments[i]["start"] - raw_start))
+
+    if require_complete:
+        # Strict mode: only ever start where a sentence starts, and only accept a
+        # start from which a complete ending is reachable inside the length bounds.
+        openings = [i for i in range(len(segments))
+                    if i == 0 or _ends_a_sentence(segments[i - 1].get("text", ""))]
+        if not openings:
+            return (None, None)
+        # Nearest opening at or before the requested point, then walk forward.
+        start_pos = 0
+        for pos, i in enumerate(openings):
+            if segments[i]["start"] <= segments[idx]["start"]:
+                start_pos = pos
+            else:
+                break
+        # Try a handful of openings from there; the first that yields a complete
+        # window wins. Bounded so one unpunctuated stretch can't scan the video.
+        for pos in range(start_pos, min(start_pos + 12, len(openings))):
+            cand = openings[pos]
+            end = _complete_window(segments, cand, min_dur, max_dur)
+            if end is not None:
+                return round(segments[cand]["start"], 3), round(end, 3)
+        return (None, None)
+
     # Nudge to the nearest sentence-opening segment within a small window (<=2 segs).
     for back in range(0, 3):
         j = idx - back
@@ -494,7 +591,8 @@ def _sentence_start_indices(segments: list) -> list:
 
 def _generate_dense_clips(segments: list, n_needed: int, chosen: list,
                           log, min_dur: float = DEFAULT_MIN_CLIP_LEN,
-                          max_dur: float = DEFAULT_MAX_CLIP_LEN) -> list:
+                          max_dur: float = DEFAULT_MAX_CLIP_LEN,
+                          require_complete: bool = False) -> list:
     """Produce up to n_needed coverage clips SPREAD OUT across the video with minimal
     overlap. Each starts at a sentence boundary, ends on a complete sentence, varies
     in length, and starts at least `min_gap` from every other clip."""
@@ -510,8 +608,9 @@ def _generate_dense_clips(segments: list, n_needed: int, chosen: list,
     for k, si in enumerate(starts):
         a = segments[si]["start"]
         L = length_cycle[k % len(length_cycle)]
-        s, e = snap_to_sentence_boundaries(a, a + L, segments, min_dur, max_dur)
-        if e - s >= min_dur:
+        s, e = snap_to_sentence_boundaries(a, a + L, segments, min_dur, max_dur,
+                                           require_complete=require_complete)
+        if s is not None and e - s >= min_dur:
             pool.append((s, e))
     pool.sort()
 
@@ -548,15 +647,24 @@ def _generate_dense_clips(segments: list, n_needed: int, chosen: list,
 # ─────────────────────────────────────────────────────────────
 # AI selection — MODULAR & CHUNKED
 # ─────────────────────────────────────────────────────────────
-# The free-tier LLM context is small, so a long transcript is split into chunks
-# and each chunk is analysed separately, then the picks are merged. To use a
-# paid/large-context model later, set these env vars — NO code change needed:
-#   GROQ_SELECTION_MODEL          (e.g. a 128k-context model)
-#   GROQ_SELECTION_MODEL_FALLBACK
-#   SELECTION_CHUNK_CHARS=200000  (large => whole transcript in ONE call, no chunking)
+# A long transcript is split into chunks, each chunk is analysed separately, and the
+# picks are merged and then ranked against each other.
+#
+# The chunk SIZE is not a constant — it comes from providers.chunk_chars_for(), which
+# sizes it for whichever model is actually going to answer. This matters enormously:
+# a 60-minute Hindi transcript is ~78k characters, which is ONE Gemini call but a
+# dozen Groq calls that then throttle each other against a 12k tokens/minute ceiling.
+# Sizing every provider like the smallest one was why long videos returned no AI
+# picks at all and silently fell back to time-based coverage clips.
+#
+# Override per-run with SELECTION_CHUNK_CHARS (a large value forces one call).
+#   GROQ_SELECTION_MODEL / GROQ_SELECTION_MODEL_FALLBACK — the Groq models to use.
+#   SELECTION_MAX_CHUNKS — hard ceiling on calls per job, so a 3-hour upload cannot
+#                          fan out into a hundred requests.
 SELECTION_MODEL_PRIMARY  = os.environ.get("GROQ_SELECTION_MODEL", "llama-3.3-70b-versatile")
 SELECTION_MODEL_FALLBACK = os.environ.get("GROQ_SELECTION_MODEL_FALLBACK", "llama-3.1-8b-instant")
-SELECTION_CHUNK_CHARS    = int(os.environ.get("SELECTION_CHUNK_CHARS", "6000"))
+SELECTION_MAX_CHUNKS     = int(os.environ.get("SELECTION_MAX_CHUNKS", "16"))
+SELECTION_CHUNK_PAUSE    = float(os.environ.get("SELECTION_CHUNK_PAUSE", "0"))
 
 def _selection_prompt_header(min_len: float, max_len: float) -> str:
     """The selector's brief. Written around ONE objective — views — because that is
@@ -658,6 +766,74 @@ def _call_selection_llm(client, prompt: str, log: DiagnosticLog, prefer_model: s
         return []
 
 
+def _plan_chunks(segments: list, prefer_model: str, log: DiagnosticLog) -> tuple:
+    """Split the transcript into as FEW calls as the chosen model can swallow.
+
+    Two forces are balanced here. Chunks must be small enough that one call fits the
+    provider's per-request and per-minute budget, and few enough that the job does not
+    turn into dozens of round trips — every chunk re-sends the ~700-token selection
+    brief, so over-splitting wastes a real slice of a free-tier allowance on repeated
+    boilerplate. When the transcript would exceed SELECTION_MAX_CHUNKS the chunks are
+    widened to fit that ceiling rather than the count being allowed to grow."""
+    budget = providers.chunk_chars_for(prefer_model)
+    total = sum(len(s.get("text", "")) + 24 for s in segments)
+    needed = max(1, math.ceil(total / max(1, budget)))
+    if needed > SELECTION_MAX_CHUNKS:
+        budget = math.ceil(total / SELECTION_MAX_CHUNKS)
+        log.log(f"  Transcript is {total} chars — widening chunks to ~{budget} chars "
+                f"to stay within {SELECTION_MAX_CHUNKS} calls")
+    return _chunk_segments(segments, budget), budget
+
+
+def _rank_across_chunks(picks: list, num_clips: int, log: DiagnosticLog,
+                        clip_prompt: str, min_len: float, max_len: float,
+                        prefer_model: str) -> list:
+    """Score a multi-chunk shortlist against ITSELF and keep the best `num_clips`.
+
+    Chunk scores are not comparable: each call only ever saw its own slice, so the
+    best moment in a dull stretch and the best moment of the whole video both come
+    back as a 9. Sorting the merged list by those numbers is therefore close to
+    arbitrary. This second pass shows one model every candidate at once — reasons
+    only, not the transcript, so it stays a small, cheap call — and asks for a true
+    ranking. If it fails for any reason the caller's own score sort still applies, so
+    this can only improve the result, never block it."""
+    lines = "\n".join(
+        f"{i}. [{p['start']:.1f}-{p['end']:.1f}] (self-score {p.get('score', '?')}) "
+        f"{str(p.get('reason', ''))[:200]}"
+        for i, p in enumerate(picks))
+    brief = f"\nThe user asked for: {clip_prompt.strip()[:500]}\n" if clip_prompt.strip() else ""
+    prompt = f"""You are choosing the final line-up for a short-form channel.
+
+Below are candidate clips from DIFFERENT parts of one video. Each was scored in
+isolation, so the scores are NOT comparable — a "9" from a dull stretch is worse than
+a "7" from a strong one. Re-judge them against EACH OTHER on predicted views:
+hook strength in the first 3 seconds, emotional spike, and whether it stands alone.
+{brief}
+Return the best {num_clips}, strongest first, as indices from the list.
+Output ONLY valid JSON: {{"ranked": [int, ...]}}
+
+CANDIDATES:
+{lines}"""
+    raw = providers.chat(prompt, temperature=0.2, json_mode=True, log=log,
+                         groq_models=[SELECTION_MODEL_PRIMARY, SELECTION_MODEL_FALLBACK],
+                         prefer_model=prefer_model)
+    try:
+        order = json.loads(raw).get("ranked", [])
+        ranked = [picks[i] for i in order if isinstance(i, int) and 0 <= i < len(picks)]
+    except Exception as e:
+        log.log(f"    cross-chunk ranking unavailable ({e}) — keeping per-chunk scores")
+        return picks
+    if not ranked:
+        return picks
+    # Re-score by final position so the caller's existing score sort preserves this
+    # order, and keep any un-ranked candidates behind them as spares.
+    seen = {id(p) for p in ranked}
+    for rank, p in enumerate(ranked):
+        p["score"] = max(1, 10 - rank)
+    log.log(f"    cross-chunk ranking: {len(ranked)} candidate(s) re-ordered by final line-up")
+    return ranked + [p for p in picks if id(p) not in seen]
+
+
 def select_highlights_chunked(segments: list, num_clips: int, per_chunk: int,
                               log: DiagnosticLog, clip_prompt: str = "",
                               min_len: float = DEFAULT_MIN_CLIP_LEN,
@@ -668,21 +844,26 @@ def select_highlights_chunked(segments: list, num_clips: int, per_chunk: int,
     `clip_prompt` is the user's free-text description of the clips they want; when
     present it is injected as the top-priority instruction and the model is told to
     return nothing rather than pad with off-brief moments.
+    `per_chunk` may be None, in which case it is derived from the real chunk count.
     Returns a list of raw {start, end, score, reason} (un-snapped)."""
     status = providers.provider_status()
     if not status["chat_ready"] or not segments:
         return []
 
     client = None  # providers.chat manages its own clients/fallback
-    chunks = _chunk_segments(segments, SELECTION_CHUNK_CHARS)
+    chunks, budget = _plan_chunks(segments, prefer_model, log)
+    # Ask each chunk for its share of the target, plus a little headroom so the
+    # cross-chunk ranking has something to choose between.
+    if not per_chunk:
+        per_chunk = max(2, math.ceil(num_clips / len(chunks)) + (1 if len(chunks) > 1 else 0))
     brief = _clip_prompt_block(clip_prompt)
     log.log(f"  AI selection: {len(segments)} segments -> {len(chunks)} chunk(s) "
-            f"(model={prefer_model if prefer_model != 'auto' else SELECTION_MODEL_PRIMARY + ' (auto)'}, "
-            f"~{SELECTION_CHUNK_CHARS} chars/chunk, {per_chunk} picks/chunk)")
+            f"(model={prefer_model if prefer_model != 'auto' else 'auto'}, "
+            f"~{budget} chars/chunk, {per_chunk} picks/chunk)")
     if brief:
         log.log(f"  User brief active: {clip_prompt.strip()[:200]}")
 
-    all_picks = []
+    all_picks, failed = [], 0
     for ci, chunk in enumerate(chunks):
         chunk_text = "".join(f"[{s['start']:.2f} - {s['end']:.2f}] {s['text']}\n" for s in chunk)
         prompt = f"""{_selection_prompt_header(min_len, max_len)}{brief}
@@ -697,9 +878,25 @@ Output ONLY valid JSON: {{"highlights": [{{"start": float, "end": float, "score"
 TRANSCRIPT PORTION:
 {chunk_text}"""
         picks = _call_selection_llm(client, prompt, log, prefer_model)
+        if not picks:
+            failed += 1
         log.log(f"    chunk {ci+1}/{len(chunks)}: {len(picks)} pick(s)")
         all_picks.extend(picks)
+        # Optional throttle for tiny free tiers. Off by default: providers.chat
+        # already waits out a 429 for exactly as long as the provider asks, which
+        # beats sleeping between calls that had budget to spare.
+        if SELECTION_CHUNK_PAUSE and ci + 1 < len(chunks):
+            time.sleep(SELECTION_CHUNK_PAUSE)
 
+    if failed:
+        log.log(f"  NOTE: {failed}/{len(chunks)} chunk(s) returned nothing. If this is most of "
+                f"them, the selection model ran out of free-tier budget — Gemini Flash reads "
+                f"the whole transcript in one call and is the better pick for long videos.")
+
+    # Only worth a second call when there is a genuine surplus to choose from.
+    if len(chunks) > 1 and len(all_picks) > num_clips:
+        all_picks = _rank_across_chunks(all_picks, num_clips, log, clip_prompt,
+                                        min_len, max_len, prefer_model)
     return all_picks
 
 
@@ -1105,6 +1302,9 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
         log.error(f"Failed to read transcript: {e}", e)
         segments = []
 
+    # Recover real sentence boundaries before anything tries to snap to them.
+    segments = split_into_sentences(segments, log)
+
     total_duration = (segments[-1]["end"] - segments[0]["start"]) if segments else 60.0
     minutes = max(1, round(total_duration / 60.0))
     log.log(f"  Total video duration: {total_duration:.2f}s (~{minutes} min)")
@@ -1113,8 +1313,12 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     #   "multi" (default) — maximise coverage: ~1 clip per minute, each 20-40s.
     #   "best"            — quality over quantity: only the most interesting
     #                       ~half-as-many moments, each a longer 40-60s clip.
+    #   "hook"            — cold-open mode: the clip's strongest line plays first,
+    #                       then the clip runs in full. Pinned to 40-60s because a
+    #                       hook plus its full context does not fit in less, and
+    #                       every clip must be a COMPLETE thought (see below).
     clip_mode = str(options.get("clip_mode", "multi")).lower()
-    if clip_mode not in ("multi", "best"):
+    if clip_mode not in ("multi", "best", "hook"):
         clip_mode = "multi"
     log.log(f"  Clip mode: {clip_mode}")
 
@@ -1122,7 +1326,9 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     #   - "auto" (default): one clip per minute of video (15-min video -> ~15 clips).
     #     In "best" mode this halves to the strongest moments only.
     #   - an explicit number: used directly, but never more than the per-mode cap.
-    if clip_mode == "best":
+    if clip_mode in ("best", "hook"):
+        # Both are "fewer, stronger" modes: a 40-60s clip cannot be cut once a
+        # minute without overlapping itself.
         max_for_video = max(1, min(math.ceil(minutes / 2), _ABS_MAX_CLIPS))
     else:
         max_for_video = max(1, min(minutes, _ABS_MAX_CLIPS))
@@ -1151,22 +1357,33 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     asked_max = options.get("max_clip_len")
     untouched = (asked_min in (None, "", DEFAULT_MIN_CLIP_LEN)
                  and asked_max in (None, "", DEFAULT_MAX_CLIP_LEN))
-    if clip_mode == "best" and untouched:
+    if clip_mode == "hook":
+        # Not negotiable: the mode IS "40-60s, complete thought, opened on its
+        # best line". A shorter window cannot hold a hook plus its own context,
+        # so the length control is hidden in this mode rather than ignored.
+        min_len, max_len = 40.0, 60.0
+    elif clip_mode == "best" and untouched:
         min_len, max_len = 40.0, 60.0
     else:
         min_len, max_len = clamp_clip_bounds(asked_min, asked_max, log)
     log.log(f"  Clip length bounds: {min_len:.0f}s min / {max_len:.0f}s max")
 
+    # Hook mode refuses clips that stop mid-thought: a cold open only works if the
+    # body that follows it actually resolves.
+    require_complete = (clip_mode == "hook")
+    if require_complete:
+        log.log("  Complete-thought enforcement: ON (clips must end on a finished sentence)")
+
     valid = []
 
     # Run the modular, chunked LLM selector and turn its picks into validated clips.
-    per_chunk = max(2, math.ceil(num_clips / max(1, math.ceil(
-        (len(segments) and sum(len(s.get('text','')) for s in segments) or 1) / SELECTION_CHUNK_CHARS))))
+    # per_chunk is derived inside the selector, which is the only place that knows how
+    # many chunks the chosen model actually needs.
     clip_prompt = str(options.get("clip_prompt", "") or "").strip()
-    raw_picks = select_highlights_chunked(segments, num_clips, per_chunk, log,
+    raw_picks = select_highlights_chunked(segments, num_clips, None, log,
                                           clip_prompt=clip_prompt,
                                           min_len=min_len, max_len=max_len,
-                                          prefer_model=str(options.get("selection_model", "auto")))
+                                          prefer_model=str(options.get("selection_model", providers.DEFAULT_SELECTION_MODEL)))
 
     for h in raw_picks:
         try:
@@ -1174,7 +1391,13 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
             raw_e = float(h.get("end", 0))
         except (TypeError, ValueError):
             continue
-        snapped_s, snapped_e = snap_to_sentence_boundaries(raw_s, raw_e, segments, min_len, max_len)
+        snapped_s, snapped_e = snap_to_sentence_boundaries(
+            raw_s, raw_e, segments, min_len, max_len, require_complete=require_complete)
+        if snapped_s is None:
+            # Strict mode found no complete sentence window around this pick.
+            log.log(f"    dropped a pick at {raw_s:.1f}s — no complete thought fits "
+                    f"{min_len:.0f}-{max_len:.0f}s there")
+            continue
         dur = snapped_e - snapped_s
         if dur >= min_len and _distinct(snapped_s, snapped_e, valid):
             valid.append({
@@ -1182,6 +1405,28 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
                 "score": int(h.get("score", 8)) if str(h.get("score", 8)).isdigit() else 8,
                 "reason": h.get("reason", "AI-selected highlight"),
             })
+    # Strict mode must never be the reason a job returns nothing. If no pick had a
+    # complete sentence window (a transcript with almost no punctuation will do
+    # this), re-snap best-effort rather than shipping zero clips.
+    if require_complete and not valid and raw_picks:
+        log.log("  No pick had a complete-sentence window — falling back to "
+                "best-effort snapping so the job still produces clips.")
+        for h in raw_picks:
+            try:
+                raw_s, raw_e = float(h.get("start", 0)), float(h.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            s2, e2 = snap_to_sentence_boundaries(raw_s, raw_e, segments, min_len, max_len)
+            if s2 is None:
+                continue
+            if e2 - s2 >= min_len and _distinct(s2, e2, valid):
+                valid.append({
+                    "start": s2, "end": e2,
+                    "score": int(h.get("score", 8)) if str(h.get("score", 8)).isdigit() else 8,
+                    "reason": h.get("reason", "AI-selected highlight"),
+                })
+        require_complete = False    # coverage fill must use the same relaxed rule
+
     valid.sort(key=lambda v: v.get("score", 0), reverse=True)
     log.log(f"  AI produced {len(valid)} valid, distinct clip(s)")
 
@@ -1200,7 +1445,8 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
             if clip_prompt:
                 log.log("\n  Brief matched nothing — falling back to general coverage clips.")
             needed = num_clips - len(valid)
-            coverage = _generate_dense_clips(segments, needed, valid, log, min_len, max_len)
+            coverage = _generate_dense_clips(segments, needed, valid, log, min_len, max_len,
+                                             require_complete=require_complete)
             log.log(f"  Coverage fill: requested {needed} more, generated {len(coverage)}")
             valid.extend(coverage)
 
@@ -1331,7 +1577,11 @@ def execute_selection_workflow(
     if options is None:
         options = {"viral": True, "emotional": True, "key": True, "trend": False, "num_clips": 3}
     options.setdefault("num_clips", 3)
-    # Clip selection mode: "multi" (~1 clip/min, 20-40s) or "best" (~n/2 clips, 40-60s).
+    # Clip selection mode:
+    #   "multi"      ~1 clip/min, 20-40s
+    #   "best"       ~n/2 clips, 40-60s
+    #   "hook"       ~n/2 clips, pinned 40-60s, cold-open, complete thoughts only
+    #   "sequential" whole video split on the clock
     options.setdefault("clip_mode", "multi")
     # Free-text brief describing the clips the user wants ('' = no brief, pick generally).
     options.setdefault("clip_prompt", "")
@@ -1339,8 +1589,17 @@ def execute_selection_workflow(
     # overrides them when the caller left both at the defaults.
     options.setdefault("min_clip_len", DEFAULT_MIN_CLIP_LEN)
     options.setdefault("max_clip_len", DEFAULT_MAX_CLIP_LEN)
-    # Hook-first: splice the clip's own peak moment onto the front as a cold open.
-    options.setdefault("hook_first", True)
+    # Hook-first is now a MODE, not a side-setting: clip_mode="hook" turns it on and
+    # every other mode turns it off. It also pins the picker to Gemini, which is the
+    # only one that reads a long transcript in one pass — a cold open chosen from a
+    # partial view of the video is guesswork.
+    if str(options.get("clip_mode", "")).lower() == "hook":
+        options["hook_first"] = True
+        if str(options.get("selection_model", "auto")).lower() in ("", "auto"):
+            options["selection_model"] = "gemini"
+            log.log("   Hook mode: selection model pinned to Gemini")
+    else:
+        options["hook_first"] = False
     options.setdefault("hook_len", HOOK_LEN_DEFAULT)
     # Post-render passes (run in burn_subtitles once every clip is cut):
     #   viral_council — 3 personas + judge rank the clips by predicted views
@@ -1362,7 +1621,10 @@ def execute_selection_workflow(
     options.setdefault("title_color", "")                   # '#RRGGBB' headline colour ("" = from the style)
     options.setdefault("aspect", "9:16")                    # 9:16 | 4:5 | 1:1 | 16:9
     options.setdefault("fit", "fit")                        # fit = letterbox, fill = crop to cover
-    options.setdefault("selection_model", "auto")           # which LLM picks the clips (providers.SELECTION_MODELS)
+    # Which LLM picks the clips (providers.SELECTION_MODELS). Defaults to Gemini —
+    # with no key it costs nothing, because chat() falls straight through to the next
+    # provider in the chain rather than failing.
+    options.setdefault("selection_model", providers.DEFAULT_SELECTION_MODEL)
     options.setdefault("hindi_font", "")                    # noto|mukta|hind|rozha|kalam ('' = auto)
     options.setdefault("english_font", "")                  # poppins|anton|bebas|archivo|fjalla ('' = auto)
     options.setdefault("video_quality", "best")             # best|1080|720|480|360 (link downloads)
@@ -1514,7 +1776,7 @@ def execute_selection_workflow(
                     log.error(f"Could not re-read transcript for hook selection: {e}")
             hooks_made = select_hooks(highlights, hook_segments, log,
                                       hook_len=options.get("hook_len", HOOK_LEN_DEFAULT),
-                                      prefer_model=str(options.get("selection_model", "auto")))
+                                      prefer_model=str(options.get("selection_model", providers.DEFAULT_SELECTION_MODEL)))
             with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
                 json.dump(highlights, f, indent=4, ensure_ascii=False)
 
@@ -1556,7 +1818,7 @@ def execute_selection_workflow(
             "hook_first": bool(options.get("hook_first", True)) and not sequential,
             "hook_len": float(options.get("hook_len", HOOK_LEN_DEFAULT)),
             "hooks_made": hooks_made,
-            "selection_model": options.get("selection_model", "auto"),
+            "selection_model": options.get("selection_model", providers.DEFAULT_SELECTION_MODEL),
             # Post-render extras the burn stage runs once all clips are cut.
             "viral_council": bool(options.get("viral_council", True)),
             "publish_kit": bool(options.get("publish_kit", True)),

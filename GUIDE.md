@@ -241,6 +241,28 @@ instead of failing.
 Clips appear on the page one by one as they finish. Download them individually, or
 grab everything as a ZIP.
 
+### Start from where you're posting
+
+At the top of **How should it be cut?**, pick **YouTube Shorts**, **Instagram Reels** or
+**Instagram Feed**. Everything — shape, clip length, caption style — is set correctly
+for that platform straight away.
+
+It's only a starting point: change anything you like and the choice quietly switches to
+**Custom**, so the label never claims a setting you've since changed.
+
+### The four ways to cut
+
+| Mode | What you get |
+|---|---|
+| **Many clips** | Roughly one clip per minute — the widest net |
+| **Best moments only** | Fewer, stronger clips (about one per two minutes) |
+| **Hook first** | Opens on the clip's best line, then plays it in full |
+| **Sequential parts** | The whole video split end to end into Part 1, Part 2, Part 3… |
+
+**Hook first** is the one to try if clips feel slow to start. It fixes clips at 40s–1:00,
+uses Gemini to pick them, and guarantees each clip is a complete thought — it will never
+stop you mid-sentence.
+
 ### Cutting a video into Part 1, Part 2, Part 3…
 
 Instead of letting the AI pick highlights, you can split the **whole** video into

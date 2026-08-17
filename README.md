@@ -115,8 +115,8 @@ Every step that can fail has somewhere to fall back to, so one outage never sink
 
 | Step | Fallback chain |
 |---|---|
-| Text / AI selection | Groq → Gemini → OpenRouter → local Ollama |
-| Transcription | Groq Whisper → Deepgram → local faster-whisper (offline) |
+| Text / AI selection | Gemini → Groq → OpenRouter |
+| Transcription | Deepgram → Groq Whisper → local faster-whisper (offline) |
 | Per-clip captions | Deepgram → Groq → local → slice the full transcript |
 | Video download | cookies → no cookies → android client → any format |
 | Audio extraction | 16 kHz → 44.1 kHz → forgiving re-encode |
@@ -131,14 +131,23 @@ server restart (jobs interrupted mid-run are marked failed instead of spinning f
 
 Order is configurable — see `CHAT_ORDER` / `TRANSCRIBE_ORDER` in `.env.example`.
 
-### Fully offline (optional)
+### Long videos
 
-Add these and ShortsAI keeps working with **no internet and no API keys**:
+A transcript too large for one call is split into chunks, each chunk is analysed
+separately, and the picks are then ranked **against each other** so clips from
+different parts of the video compete fairly (a chunk only ever sees its own slice, so
+its scores mean nothing on their own).
+
+Chunk size is chosen per model, which is why the picker matters on long uploads.
+Gemini Flash takes a 60-minute transcript in **one** call; Groq's free tier allows
+12,000 tokens *per minute* in total, and Hindi costs about 0.5 tokens per character,
+so the same transcript becomes a dozen calls that throttle each other. Gemini is the
+default for exactly this reason — a rate-limited pick still falls back to Groq.
+
+### Offline transcription (optional)
 
 ```bash
-pip install faster-whisper          # offline transcription
-# install Ollama from https://ollama.com, then:
-ollama pull llama3.1                # offline text/selection
+pip install faster-whisper          # offline transcription, never rate-limited
 ```
 
 ---
@@ -148,7 +157,8 @@ ollama pull llama3.1                # offline text/selection
 | Feature | Options | Default |
 |---|---|---|
 | Clip brief | free text — describe what you want | *(blank)* |
-| Clip mode | `multi` (~1/min, 20–40s) · `best` (fewer, 40–60s) · `sequential` (whole video → parts) | multi |
+| Platform preset | YouTube Shorts · Instagram Reels · Instagram Feed · Custom | Custom |
+| Clip mode | `multi` (~1/min, 20–40s) · `best` (fewer, 40–60s) · `hook` (cold open, 40–60s) · `sequential` (whole video → parts) | multi |
 | Number of clips | auto (1 per minute) or 5–60 | auto |
 | Part length *(sequential)* | 10s – 5min | 30s |
 | Series title *(sequential)* | free text, burned on every part | *(blank)* |
@@ -184,6 +194,47 @@ audio between parts.
 
 With captions switched off this mode needs no transcription at all, so splitting a
 long video is near-instant and costs nothing in API calls.
+
+### Hook-first mode
+
+Was a checkbox, now a mode — because it is not a garnish on a clip, it changes what
+a good clip *is*. Picking it fixes three things together:
+
+- **40s – 1:00 clips.** A cold open plus the context that pays it off does not fit in
+  less, so the length control is hidden rather than shown-but-overridden.
+- **Gemini picks.** It reads the whole transcript in one pass; a hook chosen from a
+  partial view is guesswork. Other models stay available for the other modes.
+- **Complete thoughts only.** A clip must open a sentence and close one. Picks with no
+  complete window inside the length bounds are dropped rather than cut mid-thought.
+
+The clip's strongest line is spliced onto the front as a ~3s cold open, then the clip
+plays in full.
+
+> If a transcript has almost no punctuation, strict enforcement would return nothing —
+> so it falls back to best-effort snapping and says so in the log. A job never returns
+> zero clips because the rule was too strict.
+
+### Sentence-accurate cutting
+
+Some providers return the **entire video as one segment** — Deepgram nova-3 routinely
+does, e.g. 150s of speech as a single entry with 689 words. Sentence snapping then had
+no boundaries to snap to, and clips were cut wherever the clock landed, mid-sentence.
+
+The punctuation is still there, inside the text. ShortsAI now re-cuts segments into
+real sentences using the word-level timings, so every mode cuts on genuine boundaries.
+On a typical Hindi clip that turns 1 segment into 43.
+
+### Platform presets
+
+A preset is a starting point, never a lock. Pick where you are posting and the shape,
+length, captions and mode are already right; change anything and the choice flips to
+**Custom**, so the label never claims settings you have since edited.
+
+| Preset | Shape | Length | Mode | Captions |
+|---|---|---|---|---|
+| YouTube Shorts | 9:16 | 30–60s | Best moments | Bold, headline on |
+| Instagram Reels | 9:16 | 40–60s | Hook first | Karaoke |
+| Instagram Feed | 4:5 | 20–45s | Best moments | Outline, raised clear of IG's caption bar |
 
 ### Drag-and-drop placement
 

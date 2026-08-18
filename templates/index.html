@@ -1822,6 +1822,49 @@ dialog::backdrop{
   #edVideo{max-height:34vh}
 }
 
+/* ── Clip review + edit ──────────────────────────────────────────────────
+   A modal over the results, because editing one clip is a focused task: the
+   list behind it is irrelevant until you are done. */
+.rv{position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.62);
+  display:flex; align-items:center; justify-content:center; padding:20px}
+.rv-box{background:var(--bg); border:1px solid var(--line-strong); border-radius:var(--r-lg);
+  width:min(1180px,100%); max-height:92vh; display:flex; flex-direction:column;
+  box-shadow:0 30px 70px -20px rgba(0,0,0,.8); overflow:hidden}
+.rv-head,.rv-foot{display:flex; align-items:center; gap:9px; padding:13px 16px}
+.rv-head{border-bottom:1px solid var(--line)}
+.rv-foot{border-top:1px solid var(--line)}
+.rv-sp{flex:1}
+.rv-body{display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);
+  gap:16px; padding:14px 16px; overflow:auto}
+.rv-stage{position:relative; background:#000; border-radius:var(--r); overflow:hidden}
+#rvVideo{width:100%; max-height:44vh; display:block; object-fit:contain; background:#000}
+/* The crop box is drawn over the video, so it must read against any footage:
+   a bright outline plus a dimmed surround rather than a fill. */
+.rv-crop{position:absolute; inset:0; cursor:crosshair}
+.rv-crop i{position:absolute; border:2px solid #66BB6A; box-shadow:0 0 0 9999px rgba(0,0,0,.45);
+  left:10%; top:10%; width:80%; height:80%; cursor:move}
+.rv-crop-row{margin-top:10px}
+.rv-sub-h{display:flex; align-items:baseline; gap:8px; margin-bottom:8px}
+.rv-cues{display:flex; flex-direction:column; gap:6px; max-height:52vh; overflow:auto; padding-right:2px}
+.rv-cue{display:grid; grid-template-columns:74px minmax(0,1fr) 26px; gap:8px; align-items:start}
+.rv-cue .tt{font-variant-numeric:tabular-nums; font-size:var(--t-xs); color:var(--text-3);
+  padding-top:9px; cursor:pointer}
+.rv-cue .tt:hover{color:var(--text)}
+.rv-cue textarea{background:var(--surface-2); border:1px solid var(--line); color:var(--text);
+  border-radius:8px; padding:7px 9px; font:inherit; font-size:var(--t-sm); width:100%;
+  resize:vertical; min-height:38px; line-height:1.35}
+.rv-cue[data-edited="1"] textarea{border-color:#66BB6A}
+.rv-cue .x{background:none; border:none; color:var(--text-3); cursor:pointer; padding:6px 2px}
+.rv-cue .x:hover{color:var(--text)}
+.rv-cue[data-cut="1"] textarea{opacity:.4; text-decoration:line-through}
+@media (max-width:860px){
+  .rv{padding:0}
+  .rv-box{max-height:100vh; border-radius:0; width:100%}
+  .rv-body{grid-template-columns:minmax(0,1fr)}
+  #rvVideo{max-height:32vh}
+  .rv-cues{max-height:34vh}
+}
+
 /* Speaker colour rows (podcast mode). */
 .spk-row{display:grid; grid-template-columns:58px minmax(0,1fr); gap:10px;
   align-items:center; margin-bottom:8px}
@@ -2429,6 +2472,62 @@ dialog::backdrop{
 
     <!-- Results ─────────────────────────────────────────────────────────── -->
     <div class="panel" id="results" hidden></div>
+
+    <!-- Per-clip review + edit. Opened from a finished clip; edits re-render
+         that clip in place. -->
+    <div class="rv" id="rv" hidden role="dialog" aria-modal="true" aria-label="Edit clip">
+      <div class="rv-box">
+        <div class="rv-head">
+          <b id="rvName">Clip</b>
+          <span class="rv-sp"></span>
+          <button type="button" class="ed-btn" id="rvClose">Close</button>
+        </div>
+
+        <div class="rv-body">
+          <div class="rv-left">
+            <div class="rv-stage">
+              <video id="rvVideo" preload="metadata" playsinline controls></video>
+              <div class="rv-crop" id="rvCrop" hidden><i></i></div>
+            </div>
+
+            <div class="ed-tl" id="rvTl">
+              <div class="ed-sel" id="rvKeep"></div>
+              <div class="ed-play" id="rvPlay"></div>
+            </div>
+            <div class="ed-bar">
+              <button type="button" class="ed-btn" id="rvTrimIn">Trim start here</button>
+              <button type="button" class="ed-btn" id="rvTrimOut">Trim end here</button>
+              <button type="button" class="ed-btn" id="rvTrimReset">Reset</button>
+            </div>
+            <p class="help" id="rvTrimInfo"></p>
+
+            <div class="rv-crop-row">
+              <label class="switch">
+                <input type="checkbox" id="rvCropOn"><span class="track"></span>
+                <span class="txt">Crop the frame<small>Drag the box on the video.</small></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="rv-right">
+            <div class="rv-sub-h">
+              <b>Subtitles</b>
+              <span class="opt" id="rvCueCount"></span>
+            </div>
+            <div class="rv-cues" id="rvCues"></div>
+            <p class="help" id="rvSubNote">Fix a wrong word and it is re-timed evenly across
+              that line — the original word timings no longer apply once the text changes.</p>
+          </div>
+        </div>
+
+        <div class="rv-foot">
+          <span class="help" id="rvStatus"></span>
+          <span class="rv-sp"></span>
+          <button type="button" class="btn btn-ghost btn-sm" id="rvCancel">Cancel</button>
+          <button type="button" class="btn btn-sm" id="rvSave">Save &amp; re-render</button>
+        </div>
+      </div>
+    </div>
   </main>
 
   <!-- ── Preview ───────────────────────────────────────────────────────── -->
@@ -3799,6 +3898,233 @@ function edWire() {
   });
 }
 
+/* ═════ Clip review + edit ══════════════════════════════════════════════════
+   Fix a caption, trim the ends, crop the frame — then re-render that one clip.
+   The clip is replaced in place; the old file survives until the new one is
+   proven good, which the backend guarantees. */
+
+const RV = { index: null, file: "", dur: 0, t0: 0, t1: 0,
+             cues: [], original: [], crop: null, busy: false };
+
+function rvOpen(index, filename) {
+  RV.index = index; RV.file = filename;
+  RV.t0 = 0; RV.t1 = 0; RV.crop = null; RV.busy = false;
+  $("rvName").textContent = filename.replace(/\.mp4$/i, "").replace(/_/g, " ");
+  $("rvStatus").textContent = "";
+  $("rvCropOn").checked = false;
+  $("rvCrop").hidden = true;
+  $("rv").hidden = false;
+
+  const v = $("rvVideo");
+  // Cache-bust: an edited clip keeps its name, so the browser would show the old one.
+  v.src = `/jobs/${S.jobId}/clips/${filename}?v=${Date.now()}`;
+  v.load();
+
+  rvLoadCues();
+  rvPaint();
+}
+
+function rvClose() {
+  const v = $("rvVideo");
+  try { v.pause(); v.removeAttribute("src"); v.load(); } catch (_) {}
+  $("rv").hidden = true;
+}
+
+async function rvLoadCues() {
+  const box = $("rvCues");
+  box.textContent = "";
+  RV.cues = []; RV.original = [];
+  try {
+    const r = await fetch(`/jobs/${S.jobId}/clips/${RV.index}/subtitles`);
+    if (!r.ok) {
+      $("rvCueCount").textContent = "none for this clip";
+      $("rvSubNote").textContent = "This clip was rendered without captions, so there is "
+        + "nothing to correct — trimming and cropping still work.";
+      return;
+    }
+    const d = await r.json();
+    RV.cues = (d.cues || []).map((c) => ({ ...c, cut: false }));
+    RV.original = RV.cues.map((c) => c.text);
+    rvRenderCues();
+  } catch (e) {
+    $("rvCueCount").textContent = "could not load";
+  }
+}
+
+function rvRenderCues() {
+  const box = $("rvCues");
+  box.textContent = "";
+  $("rvCueCount").textContent = RV.cues.length
+    ? `${RV.cues.length} line${RV.cues.length > 1 ? "s" : ""}`
+    : "none";
+  RV.cues.forEach((c, i) => {
+    const row = el("div", "rv-cue");
+    row.dataset.edited = c.text !== RV.original[i] ? "1" : "0";
+    row.dataset.cut = c.cut ? "1" : "0";
+    const t = el("span", "tt", `${fmtT(c.start)}`);
+    t.title = "Play from here";
+    t.addEventListener("click", () => {
+      const v = $("rvVideo");
+      v.currentTime = clamp(c.start - RV.t0, 0, Math.max(0, RV.dur));
+      v.play();
+    });
+    const ta = el("textarea");
+    ta.value = c.text || "";
+    ta.rows = 2;
+    ta.setAttribute("aria-label", `Caption line ${i + 1}`);
+    ta.addEventListener("input", () => {
+      c.text = ta.value;
+      row.dataset.edited = c.text !== RV.original[i] ? "1" : "0";
+    });
+    const x = el("button", "x");
+    x.type = "button";
+    x.innerHTML = icon("i-x", 14);
+    x.title = "Remove this line from the video";
+    x.setAttribute("aria-label", `Remove caption line ${i + 1}`);
+    x.addEventListener("click", () => {
+      c.cut = !c.cut;
+      row.dataset.cut = c.cut ? "1" : "0";
+    });
+    row.append(t, ta, x);
+    box.appendChild(row);
+  });
+}
+
+function rvPaint() {
+  const v = $("rvVideo");
+  const dur = RV.dur || 0;
+  const keep = $("rvKeep"), play = $("rvPlay");
+  if (dur > 0) {
+    const lo = (RV.t0 / dur) * 100;
+    const hi = 100 - (RV.t1 / dur) * 100;
+    keep.hidden = false;
+    keep.style.left = lo + "%";
+    keep.style.width = Math.max(0.5, hi - lo) + "%";
+    play.style.left = ((v.currentTime || 0) / dur) * 100 + "%";
+  }
+  const left = Math.max(0, dur - RV.t0 - RV.t1);
+  $("rvTrimInfo").textContent = (RV.t0 || RV.t1)
+    ? `Keeping ${fmtT(RV.t0)} → ${fmtT(dur - RV.t1)} — ${left.toFixed(1)}s of ${dur.toFixed(1)}s`
+    : `Full clip — ${dur.toFixed(1)}s`;
+  $("rvSave").disabled = RV.busy || left < 0.5;
+}
+
+function rvCropValue() {
+  if (!$("rvCropOn").checked) return null;
+  const box = $("rvCrop").querySelector("i");
+  const host = $("rvCrop").getBoundingClientRect();
+  const r = box.getBoundingClientRect();
+  if (!host.width || !host.height) return null;
+  return {
+    x: +((r.left - host.left) / host.width).toFixed(4),
+    y: +((r.top - host.top) / host.height).toFixed(4),
+    w: +(r.width / host.width).toFixed(4),
+    h: +(r.height / host.height).toFixed(4),
+  };
+}
+
+async function rvSave() {
+  if (RV.busy) return;
+  RV.busy = true;
+  $("rvSave").disabled = true;
+  $("rvStatus").textContent = "Re-rendering this clip…";
+
+  // Cues marked for removal are sent as empty text: the renderer draws nothing
+  // for an empty line, which removes it without shifting anything else.
+  const segments = RV.cues.length
+    ? RV.cues.map((c) => ({ start: c.start, end: c.end,
+                            text: c.cut ? "" : (c.text || ""),
+                            text_en: c.text_en || "",
+                            text_hinglish: c.text_hinglish || "" }))
+    : undefined;
+
+  const body = { trim_start: RV.t0, trim_end: RV.t1, crop: rvCropValue() };
+  if (segments) body.segments = segments;
+
+  try {
+    const r = await fetch(`/jobs/${S.jobId}/clips/${RV.index}/edit`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "Re-render failed");
+    $("rvStatus").textContent = `Done — ${d.duration}s`;
+    // Refresh the row's link so the new file is what downloads.
+    const row = document.querySelector(`[data-clip="${RV.index}"] a.a`);
+    if (row) row.href = d.download_url;
+    setTimeout(rvClose, 700);
+  } catch (e) {
+    $("rvStatus").textContent = String(e.message || e);
+  } finally {
+    RV.busy = false;
+    rvPaint();
+  }
+}
+
+function rvWire() {
+  const v = $("rvVideo"), tl = $("rvTl");
+  if (!v || !tl) return;
+  v.addEventListener("loadedmetadata", () => { RV.dur = v.duration || 0; rvPaint(); });
+  v.addEventListener("timeupdate", rvPaint);
+  tl.addEventListener("pointerdown", (e) => {
+    const r = tl.getBoundingClientRect();
+    if (!r.width || !RV.dur) return;
+    v.currentTime = clamp(((e.clientX - r.left) / r.width) * RV.dur, 0, RV.dur);
+  });
+  $("rvTrimIn").addEventListener("click", () => {
+    RV.t0 = clamp(v.currentTime, 0, Math.max(0, RV.dur - RV.t1 - 0.5)); rvPaint();
+  });
+  $("rvTrimOut").addEventListener("click", () => {
+    RV.t1 = clamp(RV.dur - v.currentTime, 0, Math.max(0, RV.dur - RV.t0 - 0.5)); rvPaint();
+  });
+  $("rvTrimReset").addEventListener("click", () => { RV.t0 = RV.t1 = 0; rvPaint(); });
+  $("rvCropOn").addEventListener("change", (e) => { $("rvCrop").hidden = !e.target.checked; });
+  $("rvClose").addEventListener("click", rvClose);
+  $("rvCancel").addEventListener("click", rvClose);
+  $("rvSave").addEventListener("click", rvSave);
+  document.addEventListener("keydown", (e) => {
+    if (!$("rv").hidden && e.key === "Escape") rvClose();
+  });
+  rvWireCrop();
+}
+
+/* Drag to move the crop box, drag its edge to resize. Kept deliberately simple:
+   one box, move or resize, no handles to miss on a touchscreen. */
+function rvWireCrop() {
+  const host = $("rvCrop"), box = host.querySelector("i");
+  let mode = null, sx = 0, sy = 0, start = null;
+  const rectOf = () => {
+    const h = host.getBoundingClientRect(), b = box.getBoundingClientRect();
+    return { x: (b.left - h.left) / h.width, y: (b.top - h.top) / h.height,
+             w: b.width / h.width, h: b.height / h.height, hw: h.width, hh: h.height };
+  };
+  box.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    const b = box.getBoundingClientRect();
+    // Near the bottom-right corner = resize, anywhere else = move.
+    mode = (e.clientX > b.right - 22 && e.clientY > b.bottom - 22) ? "size" : "move";
+    sx = e.clientX; sy = e.clientY; start = rectOf();
+    box.setPointerCapture(e.pointerId);
+  });
+  box.addEventListener("pointermove", (e) => {
+    if (!mode || !start) return;
+    const dx = (e.clientX - sx) / start.hw, dy = (e.clientY - sy) / start.hh;
+    if (mode === "move") {
+      const x = clamp(start.x + dx, 0, 1 - start.w);
+      const y = clamp(start.y + dy, 0, 1 - start.h);
+      box.style.left = x * 100 + "%"; box.style.top = y * 100 + "%";
+    } else {
+      const w = clamp(start.w + dx, 0.08, 1 - start.x);
+      const h = clamp(start.h + dy, 0.08, 1 - start.y);
+      box.style.width = w * 100 + "%"; box.style.height = h * 100 + "%";
+    }
+  });
+  box.addEventListener("pointerup", (e) => {
+    mode = null;
+    try { box.releasePointerCapture(e.pointerId); } catch (_) {}
+  });
+}
+
 /* ═════ Options payload — the backend contract ══════════════════════════════ */
 function getOptions() {
   return {
@@ -3972,15 +4298,23 @@ function showClips(clips) {
     if (S.shown.has(c.filename)) return;
     S.shown.add(c.filename);
     const row = el("div", "clip");
+    // The clip's own index, so an edit targets the right one no matter what
+    // order they finished in.
+    const idx = parseInt((c.filename.match(/(\d+)(?=\.mp4$)/i) || [])[1] || "0", 10);
+    row.dataset.clip = String(idx);
     row.append(el("span", "no", String(S.shown.size).padStart(2, "0")));
     const mid = el("div");
     mid.append(el("div", "n", c.filename.replace(/\.mp4$/i, "").replace(/_/g, " ")),
-               el("div", "m", "9:16 · H.264" + (S.burn ? " · captions" : "")));
+               el("div", "m", `${S.aspect} · H.264` + (S.burn ? " · captions" : "")));
+    const edit = el("button", "btn btn-ghost btn-sm");
+    edit.type = "button";
+    edit.textContent = "Review & edit";
+    edit.addEventListener("click", () => rvOpen(idx, c.filename));
     const a = el("a", "btn btn-ghost btn-sm a");
     a.href = c.download_url;
     a.setAttribute("download", "");
     a.innerHTML = icon("i-dl", 14) + "<span>Download</span>";
-    row.append(mid, a);
+    row.append(mid, edit, a);
     box.appendChild(row);
   });
 }
@@ -4232,6 +4566,10 @@ $("keySave").addEventListener("click", async () => {
   titleFields();
   fitHelp();
   applyMode();
+  // The two editors attach their own listeners (timeline scrubbing, trim, save).
+  // Without these the panels render but nothing in them responds to a click.
+  edWire();
+  rvWire();
   // pywebview injects its API asynchronously and announces it with
   // `pywebviewready`; checking at boot is too early and silently skips setup.
   // Both paths are covered because the event may already have fired.

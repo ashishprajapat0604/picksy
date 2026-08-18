@@ -1522,8 +1522,34 @@ def _escape_ffmpeg_path(path: str) -> str:
     return path
 
 
+def _crop_filter(crop) -> str:
+    """A source-frame crop from {x, y, w, h} given as FRACTIONS.
+
+    Fractions rather than pixels so a crop drawn on the editor's preview means the
+    same thing at any source resolution. Returns "" for anything malformed — a bad
+    crop should cost the crop, not the render.
+    """
+    if not crop:
+        return ""
+    try:
+        if isinstance(crop, dict):
+            x, y = float(crop.get("x", 0)), float(crop.get("y", 0))
+            w, h = float(crop.get("w", 1)), float(crop.get("h", 1))
+        else:
+            x, y, w, h = (float(v) for v in crop)
+    except (TypeError, ValueError):
+        return ""
+    x, y = min(max(x, 0.0), 0.99), min(max(y, 0.0), 0.99)
+    w, h = min(max(w, 0.01), 1.0 - x), min(max(h, 0.01), 1.0 - y)
+    if w >= 0.999 and h >= 0.999 and x <= 0.001 and y <= 0.001:
+        return ""                       # a full-frame crop is a no-op
+    # Even dimensions: yuv420p cannot encode odd width/height.
+    return (f"crop=floor(iw*{w:.6f}/2)*2:floor(ih*{h:.6f}/2)*2:"
+            f"floor(iw*{x:.6f}/2)*2:floor(ih*{y:.6f}/2)*2")
+
+
 def _build_render_filter(ass_path: str, fontsdir: str = "", frame: tuple = None,
-                         fit: str = "fit") -> str:
+                         fit: str = "fit", crop=None) -> str:
     """Full -vf chain for one finished clip:
        1. put the source on the chosen canvas, either
           fit  — scaled down to fit whole, centred, black bars where it falls short
@@ -1536,6 +1562,7 @@ def _build_render_filter(ass_path: str, fontsdir: str = "", frame: tuple = None,
     # bilinear downscaling is noticeably cheaper than the default bicubic with
     # negligible quality loss at this resolution; override with SCALE_FLAGS if needed.
     scale_flags = os.environ.get("SCALE_FLAGS", "bilinear")
+    pre = _crop_filter(crop)            # crop the SOURCE before it meets the canvas
     if fit == "fill":
         chain = [
             f"scale={W}:{H}:force_original_aspect_ratio=increase:flags={scale_flags}",
@@ -1546,6 +1573,8 @@ def _build_render_filter(ass_path: str, fontsdir: str = "", frame: tuple = None,
             f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags={scale_flags}",
             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black",
         ]
+    if pre:
+        chain.insert(0, pre)
     chain.append("setsar=1")
     if ass_path:
         ass_esc = _escape_ffmpeg_path(ass_path)
@@ -1873,6 +1902,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                              caption_xy_en=None,
                              position_hi: str = "",
                              position_en: str = "",
+                             crop=None,
                              hook_start: float = None,
                              hook_end: float = None,
                              logo: dict = None) -> str:
@@ -1960,7 +1990,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         if not burn and not overlay_only:
             # ── No-subtitle path: clean 9:16 video, nothing overlaid. ──
             log.log("     Subtitles OFF -> rendering clean 9:16 clip (no captions).")
-            vf = _build_render_filter("", "", FRAME, fit)
+            vf = _build_render_filter("", "", FRAME, fit, crop)
         elif overlay_only:
             # ── Badge/title only: no transcript needed, so nothing is transcribed. ──
             log.log(f"     Subtitles OFF -> overlay-only render "
@@ -1995,7 +2025,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 caption_xy=caption_xy, title_xy=title_xy, part_xy=part_xy,
                 speaker_colours=speaker_colours,
             )
-            vf = _build_render_filter(ass_path, fontsdir, FRAME, fit)
+            vf = _build_render_filter(ass_path, fontsdir, FRAME, fit, crop)
         else:
             # 1. Ensure we have clip-local segments (with whatever language fields we need).
             if segments is None:
@@ -2158,7 +2188,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         #
         # Captions are remapped for the hooked timeline, so dropping the hook at rung 3
         # shifts them; they are rebuilt without the offset there rather than left adrift.
-        plain_vf = _build_render_filter("", "", FRAME, fit)
+        plain_vf = _build_render_filter("", "", FRAME, fit, crop)
         has_logo = bool(logo_cfg)
         base = "captions + hook" if hook_local else "captions"
         if has_logo:
@@ -2700,6 +2730,26 @@ def execute_subtitle_workflow(
         # One line for the whole render, naming how many clips actually came out.
         _want = len(raw_clips)
         _got = len(final_clips)
+        # Save the cues each clip was actually rendered from. Without this an
+        # edit would have to re-transcribe to find out what the captions said,
+        # which is both slow and non-deterministic — the text could come back
+        # different and silently "fix" something the user never asked about.
+        try:
+            subs_dir = os.path.join(job_dir, "subs")
+            os.makedirs(subs_dir, exist_ok=True)
+            for rc in raw_clips:
+                idx = rc["index"]
+                with open(os.path.join(subs_dir, f"clip_{idx}.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({
+                        "index": idx,
+                        "start": rc.get("start"),
+                        "end": rc.get("end"),
+                        "segments": clip_segments.get(idx, []),
+                    }, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            log.error(f"Could not save editable subtitles: {e}")
+
         joblog.end("Render clips", ok=(_got == _want and _got > 0),
                    detail=f"{_got}/{_want} produced"
                           + ("" if _got == _want else "  <-- some clips failed"))
@@ -2774,6 +2824,191 @@ def execute_subtitle_workflow(
     if short:
         log.log(f"\nShort run log: {short}")
     return final_clips, log.path
+
+
+# ─────────────────────────────────────────────────────────────
+# Re-render ONE clip after the user edits it
+# ─────────────────────────────────────────────────────────────
+
+def _shift_edited_segments(segments: list, delta: float, new_len: float) -> list:
+    """Move clip-local cues when the clip's start moves.
+
+    Cues are timed from the clip's own zero. Trimming the front by 3s means every
+    cue is 3s early now, and anything that fell entirely inside the removed part
+    is gone. Getting this wrong is what makes trimmed clips show subtitles from
+    the wrong moment.
+    """
+    out = []
+    for seg in segments or []:
+        try:
+            s0 = float(seg.get("start", 0)) - delta
+            e0 = float(seg.get("end", 0)) - delta
+        except (TypeError, ValueError):
+            continue
+        if e0 <= 0 or s0 >= new_len:
+            continue                       # entirely outside the kept range
+        new = dict(seg)
+        new["start"] = max(0.0, round(s0, 3))
+        new["end"] = min(new_len, round(e0, 3))
+        words = []
+        for w in seg.get("words") or []:
+            try:
+                ws = float(w.get("start", 0)) - delta
+                we = float(w.get("end", 0)) - delta
+            except (TypeError, ValueError):
+                continue
+            if we <= 0 or ws >= new_len:
+                continue
+            nw = dict(w)
+            nw["start"] = max(0.0, round(ws, 3))
+            nw["end"] = min(new_len, round(we, 3))
+            words.append(nw)
+        new["words"] = words
+        out.append(new)
+    return out
+
+
+def rerender_clip(job_dir: str, clip_index: int, edits: dict, log=None) -> dict:
+    """Re-render one clip with the user's edits, replacing it in place.
+
+    edits may contain:
+        trim_start / trim_end   seconds to remove from each end
+        segments                edited caption cues (text changed, cues deleted)
+        crop                    {x, y, w, h} as fractions of the SOURCE frame
+        any subtitle_options key (style, size, position, colour, …)
+
+    The new file is rendered to a temp name and only swapped in once it exists
+    and is a sane size. A failed edit must never destroy the clip that was
+    already there.
+    """
+    own_log = log is None
+    if own_log:
+        log = DiagnosticLog(job_dir)
+    manifest_path = os.path.join(job_dir, "clips_manifest.json")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    clips = manifest.get("clips", [])
+    rc = next((c for c in clips if c.get("index") == clip_index), None)
+    if rc is None:
+        raise ValueError(f"Clip {clip_index} is not in this job")
+
+    cfg = dict(manifest.get("subtitle_options", {}) or {})
+    for k, v in (edits or {}).items():
+        if k in ("trim_start", "trim_end", "segments", "crop"):
+            continue
+        if v is not None:
+            cfg[k] = v
+
+    # ── trim ──
+    start = float(rc.get("start") or 0.0)
+    end = float(rc.get("end") or 0.0)
+    try:
+        t0 = max(0.0, float(edits.get("trim_start") or 0.0))
+        t1 = max(0.0, float(edits.get("trim_end") or 0.0))
+    except (TypeError, ValueError):
+        t0 = t1 = 0.0
+    new_start, new_end = start + t0, end - t1
+    if new_end - new_start < 0.5:
+        raise ValueError("Trimming would leave less than half a second of video")
+
+    # ── cues ──
+    subs_path = os.path.join(job_dir, "subs", f"clip_{clip_index}.json")
+    original = []
+    if os.path.isfile(subs_path):
+        try:
+            with open(subs_path, "r", encoding="utf-8") as f:
+                original = json.load(f).get("segments", [])
+        except (OSError, ValueError):
+            original = []
+
+    if edits.get("segments") is not None:
+        segments = edits["segments"]
+        # Cues are drawn from seg["words"], NOT seg["text"] — so a corrected line
+        # would render as the original words unless the stale word timings go.
+        # There is no way to know the timing of words the user just typed, so the
+        # renderer's even-split fallback takes over for exactly the edited cues.
+        changed = 0
+        for i, sg in enumerate(segments):
+            was = original[i].get("text", "") if i < len(original) else None
+            if was is not None and (sg.get("text") or "") != was:
+                sg["words"] = []
+                changed += 1
+        if changed:
+            log.log(f"   {changed} cue(s) retimed after a text edit "
+                    f"(word timings no longer apply)")
+    elif original:
+        segments = original
+    else:
+        segments = None
+    if segments is not None and (t0 or t1):
+        segments = _shift_edited_segments(segments, t0, new_end - new_start)
+
+    log.section(f"RE-RENDER CLIP {clip_index}")
+    log.log(f"   {start:.2f}-{end:.2f}s -> {new_start:.2f}-{new_end:.2f}s"
+            + (f"  (trimmed {t0:.2f}s / {t1:.2f}s)" if (t0 or t1) else ""))
+    if edits.get("segments") is not None:
+        log.log(f"   captions edited: {len(edits['segments'])} cue(s)")
+
+    clips_dir = os.path.join(job_dir, "clips")
+    src_dims = _probe_dimensions(manifest.get("video_path") or rc["raw_path"], log)
+
+    # Render under a temp index so the existing file survives a failure.
+    tmp_index = f"{clip_index}__edit"
+    out = burn_subtitles_for_clip(
+        rc["raw_path"], tmp_index, job_dir, clips_dir, log,
+        clip_start=new_start, clip_end=new_end,
+        segments=segments,
+        title=str(cfg.get("series_title", "") or ""),
+        burn=bool(cfg.get("burn_subtitles", True)),
+        layout=str(cfg.get("subtitle_layout", "single")).lower(),
+        language=str(cfg.get("subtitle_language", "hindi")).lower(),
+        position=str(cfg.get("subtitle_position", "bottom")).lower(),
+        caption_style=str(cfg.get("caption_style", "outline")).lower(),
+        accent_color=str(cfg.get("caption_accent", "") or ""),
+        caption_color=str(cfg.get("caption_color", "") or ""),
+        caption_words=int(cfg.get("caption_words", 0) or 0),
+        aspect=str(cfg.get("aspect", DEFAULT_ASPECT)),
+        fit=str(cfg.get("fit", "fit")),
+        hindi_font_choice=str(cfg.get("hindi_font", "") or "").lower(),
+        english_font_choice=str(cfg.get("english_font", "") or "").lower(),
+        show_title=bool(cfg.get("show_title", False)),
+        src_dims=src_dims,
+        part_label=rc.get("part_label", ""),
+        show_part_label=bool(cfg.get("show_part_label", True)),
+        caption_xy=cfg.get("caption_xy"),
+        title_xy=cfg.get("title_xy"),
+        part_xy=cfg.get("part_xy"),
+        caption_size=float(cfg.get("caption_size", CAPTION_SIZE_DEFAULT)),
+        caption_xy_en=cfg.get("caption_xy_en"),
+        position_hi=str(cfg.get("subtitle_position_hi", "") or ""),
+        position_en=str(cfg.get("subtitle_position_en", "") or ""),
+        logo=_norm_logo(cfg),
+        crop=edits.get("crop"),
+    )
+    if not out or not os.path.isfile(out) or os.path.getsize(out) < 1000:
+        raise RuntimeError("The edited clip failed to render — the original is untouched")
+
+    stem = f"part_{clip_index}" if rc.get("part_label") else f"viral_clip_{clip_index}"
+    final = os.path.join(clips_dir, f"{stem}.mp4")
+    os.replace(out, final)              # atomic swap on the same filesystem
+
+    # Persist the new truth so a second edit starts from this one.
+    rc["start"], rc["end"] = round(new_start, 3), round(new_end, 3)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=1)
+    if segments is not None:
+        try:
+            os.makedirs(os.path.dirname(subs_path), exist_ok=True)
+            with open(subs_path, "w", encoding="utf-8") as f:
+                json.dump({"index": clip_index, "start": new_start, "end": new_end,
+                           "segments": segments}, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+
+    log.log(f"   SUCCESS -> {final} ({os.path.getsize(final)//1024} KB)")
+    return {"path": final, "start": new_start, "end": new_end,
+            "duration": round(new_end - new_start, 3)}
 
 
 # ─────────────────────────────────────────────────────────────

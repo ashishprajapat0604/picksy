@@ -5,6 +5,7 @@ import os
 import json
 import shutil
 import threading
+import time
 import traceback
 from typing import Optional
 from uuid import uuid4
@@ -787,6 +788,80 @@ def probe_video(path: str, request: Request):
     return {"path": p, "name": os.path.basename(p), "duration": dur,
             "width": stream.get("width"), "height": stream.get("height"),
             "size": os.path.getsize(p)}
+
+
+class ClipEdit(BaseModel):
+    trim_start: Optional[float] = 0.0
+    trim_end: Optional[float] = 0.0
+    segments: Optional[list] = None
+    crop: Optional[dict] = None
+    # Any caption option may be overridden for this clip alone.
+    caption_style: Optional[str] = None
+    caption_size: Optional[float] = None
+    subtitle_position: Optional[str] = None
+    burn_subtitles: Optional[bool] = None
+
+
+@app.get("/jobs/{job_id}/clips/{clip_index}/subtitles", tags=["Editor"])
+def get_clip_subtitles(job_id: str, clip_index: int):
+    """The cues this clip was rendered from, so they can be corrected.
+
+    Read from disk rather than re-transcribed: re-running ASR to find out what the
+    captions said is slow, and it can come back DIFFERENT, silently changing lines
+    the user never asked to touch.
+    """
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job_dir = job.get("job_dir")
+    if not job_dir:
+        raise HTTPException(status_code=400, detail="Job has no output directory yet")
+    path = os.path.join(job_dir, "subs", f"clip_{clip_index}.json")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404,
+                            detail="No editable subtitles for this clip "
+                                   "(it may have been rendered without captions)")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # Flatten to what an editor needs: one row per cue.
+    cues = [{"i": i, "start": sg.get("start"), "end": sg.get("end"),
+             "text": sg.get("text", ""),
+             "text_en": sg.get("text_en", ""),
+             "text_hinglish": sg.get("text_hinglish", "")}
+            for i, sg in enumerate(data.get("segments", []))]
+    return {"job_id": job_id, "index": clip_index,
+            "start": data.get("start"), "end": data.get("end"), "cues": cues}
+
+
+@app.post("/jobs/{job_id}/clips/{clip_index}/edit", tags=["Editor"])
+def edit_clip(job_id: str, clip_index: int, payload: ClipEdit):
+    """Apply edits and re-render this clip in place.
+
+    Synchronous on purpose: one clip is seconds of work, and the caller wants to
+    know whether it succeeded before showing the result. The original file is only
+    replaced once the new render exists and is a sane size.
+    """
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job_dir = job.get("job_dir")
+    if not job_dir or not os.path.isdir(job_dir):
+        raise HTTPException(status_code=400, detail="Job has no output directory")
+
+    edits = {k: v for k, v in payload.model_dump().items() if v is not None}
+    try:
+        result = burn_subtitles.rerender_clip(job_dir, clip_index, edits)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Re-render failed: {e}")
+
+    name = os.path.basename(result["path"])
+    # The clip changed on disk; bust any cached copy the page is holding.
+    return {"job_id": job_id, "index": clip_index, "filename": name,
+            "download_url": f"/jobs/{job_id}/clips/{name}?v={int(time.time())}",
+            "start": result["start"], "end": result["end"],
+            "duration": result["duration"]}
 
 
 @app.get("/health")

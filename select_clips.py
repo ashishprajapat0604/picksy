@@ -968,6 +968,63 @@ def time_based_highlights(duration: float, num_clips: int,
 
 
 # ─────────────────────────────────────────────────────────────
+# Manual ranges — the user marked these in and out points themselves
+# ─────────────────────────────────────────────────────────────
+
+MANUAL_MIN_LEN = 0.5
+
+
+def manual_ranges(ranges: list, duration: float, log: DiagnosticLog) -> list:
+    """Turn user-marked [start, end] pairs into highlights.
+
+    No AI, no snapping, no reordering: the whole point of marking clips by hand is
+    that the boundaries are the user's decision. The only changes made are the ones
+    that would otherwise produce a broken file — clamping to the video's real
+    length, dropping zero-length or inverted ranges, and sorting so "Clip 2" is
+    genuinely after "Clip 1".
+    """
+    out = []
+    for i, r in enumerate(ranges or []):
+        try:
+            if isinstance(r, dict):
+                start, end = float(r.get("start")), float(r.get("end"))
+                title = str(r.get("title", "") or "")
+            else:
+                start, end = float(r[0]), float(r[1])
+                title = ""
+        except (TypeError, ValueError, KeyError, IndexError):
+            log.log(f"   Range {i + 1}: unreadable — skipped")
+            continue
+
+        if end < start:
+            start, end = end, start          # marked backwards; obvious intent
+        if duration > 0:
+            start = max(0.0, min(start, duration))
+            end = max(0.0, min(end, duration))
+        if end - start < MANUAL_MIN_LEN:
+            log.log(f"   Range {i + 1}: {end - start:.2f}s is too short — skipped")
+            continue
+
+        out.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "score": 10,                     # the user chose it; nothing outranks that
+            "reason": title or f"Clip {len(out) + 1} (marked by hand)",
+            "manual": True,
+            "title": title,
+        })
+
+    out.sort(key=lambda h: h["start"])
+    total = sum(h["end"] - h["start"] for h in out)
+    log.log(f"   Manual selection: {len(out)} clip(s), {total:.0f}s of footage")
+    for i, h in enumerate(out):
+        log.log(f"     Clip {i + 1}: {h['start']:.2f}s -> {h['end']:.2f}s "
+                f"({h['end'] - h['start']:.1f}s)"
+                + (f'  "{h["title"]}"' if h["title"] else ""))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
 # Sequential "Part 1 / Part 2 / Part 3" splitting
 # ─────────────────────────────────────────────────────────────
 
@@ -1686,6 +1743,7 @@ def execute_selection_workflow(
     # per-speaker caption colours.
     # Piksy watermark: on by default so a reposted clip is traceable back here.
     options.setdefault("piksy_watermark", True)
+    options.setdefault("manual_ranges", [])                 # manual mode: [{start,end,title}]
     options.setdefault("podcast_style", "both")
     options.setdefault("host_color", "")
     options.setdefault("guest_color", "")
@@ -1733,11 +1791,48 @@ def execute_selection_workflow(
         # Splitting the whole video into Part 1 / Part 2 / Part 3 needs no AI and
         # no transcript — only the duration. Transcription runs ONLY when captions
         # are switched on, which makes a captionless 1-hour split near-instant.
-        sequential = str(options.get("clip_mode", "multi")).lower() == "sequential"
+        _mode = str(options.get("clip_mode", "multi")).lower()
+        sequential = _mode == "sequential"
+        manual = _mode == "manual"
         full_audio_path = None
         transcript_path = None
 
-        if sequential:
+        if manual:
+            # The user already decided where the clips are. Everything downstream
+            # — transcription, captions, rendering — runs exactly as it always
+            # does, which is the point: only the SELECTION is manual.
+            log.section("STEP 2 - MANUAL CLIP RANGES")
+            if status_callback: status_callback("Step 2/4: Reading your marked clips...")
+            duration = probe_duration(video_path, log)
+            log.log(f"   Video duration : {duration:.1f}s")
+            highlights = manual_ranges(options.get("manual_ranges") or [], duration, log)
+            if not highlights:
+                raise RuntimeError(
+                    "No usable clips were marked. Each clip needs a start and an end "
+                    f"at least {MANUAL_MIN_LEN}s apart.")
+            with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
+                json.dump(highlights, f, indent=4, ensure_ascii=False)
+
+            if options.get("burn_subtitles", True):
+                if status_callback: status_callback("Step 3/4: Extracting audio...")
+                log.section("STEP 3 - AUDIO + TRANSCRIPTION (for captions)")
+                joblog.begin("Extract audio")
+                full_audio_path = extract_audio(
+                    video_path, os.path.join(job_dir, "audio.mp3"), log)
+                joblog.end("Extract audio", ok=True)
+                try:
+                    joblog.begin("Transcribe full video")
+                    transcript_path = transcribe_full_video(full_audio_path, job_dir, log)
+                    joblog.end("Transcribe full video", ok=True)
+                except Exception as e:
+                    log.error(f"Transcription unavailable: {e}", e)
+                    joblog.end("Transcribe full video", ok=False, detail=str(e)[:90])
+                    log.log("   Captions disabled for this job — clips will still be cut.")
+                    options["burn_subtitles"] = False
+            else:
+                log.log("   Captions are OFF — nothing to transcribe.")
+
+        elif sequential:
             log.section("STEP 2 - SEQUENTIAL SPLIT")
             if status_callback: status_callback("Step 2/4: Measuring video length...")
             duration = probe_duration(video_path, log)
@@ -1808,7 +1903,7 @@ def execute_selection_workflow(
 
         # ── STAGE 3: AI clip selection (chunked LLM; no video cutting here) ──
         # Sequential mode already decided its parts above and skips this entirely.
-        if not sequential:
+        if not sequential and not manual:
             if status_callback:
                 status_callback("Step 4/4: AI is finding the most engaging moments...")
             if transcript_path:
@@ -1845,7 +1940,7 @@ def execute_selection_workflow(
         # coverage of the source, and splicing a replayed peak onto the front of
         # "Part 3" would break exactly that promise.
         hooks_made = 0
-        if options.get("hook_first", True) and not sequential and highlights:
+        if options.get("hook_first", True) and not sequential and not manual and highlights:
             if status_callback:
                 status_callback("Finding each clip's 3-second hook...")
             hook_segments = []
@@ -1897,8 +1992,11 @@ def execute_selection_workflow(
             "has_transcript": bool(transcript_path),
             "clip_mode": options.get("clip_mode", "multi"),
             "sequential": sequential,
+            "manual": manual,
             # Hook-first cold open: how many clips got one, and how long it is.
-            "hook_first": bool(options.get("hook_first", True)) and not sequential,
+            # Hand-marked clips keep the boundaries the user chose, so no cold open.
+            "hook_first": bool(options.get("hook_first", True))
+                          and not sequential and not manual,
             "hook_len": float(options.get("hook_len", HOOK_LEN_DEFAULT)),
             "hooks_made": hooks_made,
             "selection_model": options.get("selection_model", providers.DEFAULT_SELECTION_MODEL),

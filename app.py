@@ -682,6 +682,113 @@ def process_from_local_path(payload: LocalVideoRequest, request: Request):
     return JobResponse(job_id=job_id, status="queued")
 
 
+def _range_response(path: str, request: Request, media_type: str = "video/mp4"):
+    """Serve a file with HTTP Range support.
+
+    FileResponse sends the whole file, which makes a <video> element download a
+    2 GB source before it will let you scrub. Range replies are what make seeking
+    instant, so the editor's timeline is usable at all.
+    """
+    size = os.path.getsize(path)
+    rng = (request.headers.get("range") or "").strip()
+    if not rng.startswith("bytes="):
+        return FileResponse(path, media_type=media_type,
+                            headers={"Accept-Ranges": "bytes"})
+
+    spec = rng[6:].split(",")[0]
+    start_s, _, end_s = spec.partition("-")
+    try:
+        if start_s:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+        else:
+            # "bytes=-500" means the LAST 500 bytes, not from zero.
+            start = max(0, size - int(end_s))
+            end = size - 1
+    except ValueError:
+        raise HTTPException(status_code=416, detail="Bad Range header")
+
+    if start >= size or start > end:
+        raise HTTPException(status_code=416, detail="Range out of bounds")
+    end = min(end, size - 1)
+    length = end - start + 1
+
+    def chunks(chunk_size: int = 512 * 1024):
+        with open(path, "rb") as f:
+            f.seek(start)
+            left = length
+            while left > 0:
+                data = f.read(min(chunk_size, left))
+                if not data:
+                    break
+                left -= len(data)
+                yield data
+
+    return StreamingResponse(
+        chunks(), status_code=206, media_type=media_type,
+        headers={
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(length),
+        },
+    )
+
+
+@app.get("/source", tags=["Editor"])
+def serve_source(path: str, request: Request):
+    """Stream a local video so the editor's timeline can scrub it.
+
+    Local-only for the same reason /process/local is: this reads a named path off
+    disk, which must never be reachable from the network.
+    """
+    _require_local(request)
+    p = os.path.abspath(os.path.expanduser(path or ""))
+    if not os.path.isfile(p):
+        raise HTTPException(status_code=404, detail="No such file")
+    if os.path.splitext(p)[1].lower() not in _VIDEO_EXTS:
+        raise HTTPException(status_code=400, detail="Not a video file")
+    return _range_response(p, request)
+
+
+@app.get("/jobs/{job_id}/source", tags=["Editor"])
+def serve_job_source(job_id: str, request: Request):
+    """Stream the source video a job was cut from."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    src = job.get("source") or job.get("uploaded_path")
+    if not src:
+        job_dir = job.get("job_dir") or ""
+        cand = os.path.join(job_dir, "raw_video.mp4")
+        src = cand if os.path.isfile(cand) else None
+    if not src or not os.path.isfile(src):
+        raise HTTPException(status_code=404, detail="Source video not available")
+    return _range_response(src, request)
+
+
+@app.get("/probe", tags=["Editor"])
+def probe_video(path: str, request: Request):
+    """Duration and dimensions of a local file — what the timeline needs to draw."""
+    _require_local(request)
+    p = os.path.abspath(os.path.expanduser(path or ""))
+    if not os.path.isfile(p):
+        raise HTTPException(status_code=404, detail="No such file")
+    import subprocess as _sp
+    try:
+        r = _sp.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height",
+                     "-show_entries", "format=duration",
+                     "-of", "json", p], capture_output=True, text=True, timeout=60)
+        data = json.loads(r.stdout or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        dur = float((data.get("format") or {}).get("duration") or 0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not read the video: {e}")
+    return {"path": p, "name": os.path.basename(p), "duration": dur,
+            "width": stream.get("width"), "height": stream.get("height"),
+            "size": os.path.getsize(p)}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

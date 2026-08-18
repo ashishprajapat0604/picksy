@@ -1772,6 +1772,56 @@ dialog::backdrop{
   .rail{grid-column:1/-1}
 }
 
+/* ── Manual clip editor ──────────────────────────────────────────────────
+   A timeline the user drags on, so the marked range has to be legible against
+   the video's own colours: the selection is a solid accent band, everything
+   already marked is a muted stripe, and the playhead is a hairline that stays
+   visible over both. */
+.ed{background:var(--surface); border:1px solid var(--line); border-radius:var(--r-lg); padding:14px}
+.ed-empty{color:var(--text-3); font-size:var(--t-sm); text-align:center; padding:26px 10px}
+#edVideo{width:100%; max-height:46vh; background:#000; border-radius:var(--r);
+  display:block; object-fit:contain}
+.ed-tl{position:relative; height:46px; margin:12px 0 10px; border-radius:8px;
+  background:var(--surface-2); border:1px solid var(--line); cursor:pointer;
+  overflow:hidden; touch-action:none}
+.ed-tl:focus-visible{outline:2px solid var(--text-2); outline-offset:2px}
+.ed-ranges{position:absolute; inset:0}
+.ed-ranges i{position:absolute; top:0; bottom:0; background:var(--surface-3);
+  border-left:1px solid var(--line-strong); border-right:1px solid var(--line-strong)}
+.ed-ranges i b{position:absolute; left:4px; top:3px; font-size:10px; font-style:normal;
+  color:var(--text-3); font-weight:700}
+.ed-sel{position:absolute; top:0; bottom:0; background:rgba(102,187,106,.30);
+  border-left:2px solid #66BB6A; border-right:2px solid #66BB6A}
+.ed-play{position:absolute; top:0; bottom:0; width:2px; background:var(--text);
+  box-shadow:0 0 0 1px rgba(0,0,0,.55); pointer-events:none; left:0}
+.ed-bar{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+.ed-btn{background:var(--surface-2); border:1px solid var(--line-strong); color:var(--text);
+  border-radius:999px; padding:7px 13px; font:inherit; font-size:var(--t-sm); cursor:pointer;
+  display:inline-flex; align-items:center; gap:6px}
+.ed-btn:hover{background:var(--surface-3)}
+.ed-btn:disabled{opacity:.45; cursor:not-allowed}
+.ed-btn kbd{font:inherit; font-size:10px; opacity:.6; border:1px solid var(--line-strong);
+  border-radius:4px; padding:0 4px}
+.ed-add{background:var(--text); color:var(--bg); border-color:var(--text); font-weight:600}
+.ed-add:hover{background:var(--text)}
+.ed-time{font-variant-numeric:tabular-nums; font-size:var(--t-sm); color:var(--text-2)}
+.ed-sp{flex:1}
+.ed-list{display:flex; flex-direction:column; gap:7px}
+.ed-row{display:grid; grid-template-columns:26px 108px minmax(0,1fr) 30px; gap:9px;
+  align-items:center; background:var(--surface); border:1px solid var(--line);
+  border-radius:var(--r); padding:8px 10px}
+.ed-row .i{font-size:var(--t-xs); color:var(--text-3); font-weight:700}
+.ed-row .t{font-variant-numeric:tabular-nums; font-size:var(--t-sm); color:var(--text-2); cursor:pointer}
+.ed-row .t:hover{color:var(--text); text-decoration:underline}
+.ed-row input{background:var(--surface-2); border:1px solid var(--line); color:var(--text);
+  border-radius:7px; padding:6px 9px; font:inherit; font-size:var(--t-sm); width:100%}
+.ed-row .x{background:none; border:none; color:var(--text-3); cursor:pointer; padding:4px}
+.ed-row .x:hover{color:var(--text)}
+@media (max-width:860px){
+  .ed-row{grid-template-columns:22px 92px minmax(0,1fr) 28px; gap:6px}
+  #edVideo{max-height:34vh}
+}
+
 /* Speaker colour rows (podcast mode). */
 .spk-row{display:grid; grid-template-columns:58px minmax(0,1fr); gap:10px;
   align-items:center; margin-bottom:8px}
@@ -1950,6 +2000,12 @@ dialog::backdrop{
                 <span class="d">Cuts on who is speaking, not the clock — a question plus the
                   whole answer, so a clip never runs into the next question. Needs a Deepgram key.</span></span>
             </button>
+            <button type="button" class="choice" data-v="manual" aria-pressed="false">
+              <span class="mark"></span>
+              <span><span class="t">I'll choose the clips myself</span>
+                <span class="d">Scrub the video and mark each clip's start and end. Captions,
+                  transcription and rendering still happen automatically.</span></span>
+            </button>
             <button type="button" class="choice" data-v="sequential" aria-pressed="false">
               <span class="mark"></span>
               <span><span class="t">Sequential parts</span>
@@ -2083,6 +2139,43 @@ dialog::backdrop{
       </section>
 
       <!-- 3. CAPTIONS ───────────────────────────────────────────────────── -->
+      <!-- 2b. MANUAL CLIP MARKING ────────────────────────────────────────── -->
+      <section class="sec" id="sec-manual" hidden>
+        <h1>Mark your clips</h1>
+        <p class="lede">Scrub the video, set a start and an end, and add it to the list.
+          Everything after this — captions, transcription, rendering — still happens
+          automatically.</p>
+
+        <div class="ed" id="edBox">
+          <div class="ed-empty" id="edEmpty">Choose a video on the first step to start marking.</div>
+          <div class="ed-main" id="edMain" hidden>
+            <video id="edVideo" preload="metadata" playsinline></video>
+
+            <div class="ed-tl" id="edTl" role="slider" aria-label="Timeline"
+                 aria-valuemin="0" aria-valuenow="0" tabindex="0">
+              <div class="ed-ranges" id="edRanges"></div>
+              <div class="ed-sel" id="edSel" hidden></div>
+              <div class="ed-play" id="edPlay"></div>
+            </div>
+
+            <div class="ed-bar">
+              <button type="button" class="ed-btn" id="edToggle" aria-label="Play or pause">▶</button>
+              <span class="ed-time"><b id="edNow">0:00</b> / <span id="edDur">0:00</span></span>
+              <span class="ed-sp"></span>
+              <button type="button" class="ed-btn" id="edIn">Set start <kbd>I</kbd></button>
+              <button type="button" class="ed-btn" id="edOut">Set end <kbd>O</kbd></button>
+              <button type="button" class="ed-btn ed-add" id="edAdd" disabled>Add clip <kbd>Enter</kbd></button>
+            </div>
+            <p class="help" id="edHint">Marked: nothing yet. Arrow keys nudge by a frame; hold Shift for a second.</p>
+          </div>
+        </div>
+
+        <div class="field">
+          <span class="lbl">Your clips <span class="opt" id="edCount">none yet</span></span>
+          <div class="ed-list" id="edList"></div>
+        </div>
+      </section>
+
       <section class="sec" id="sec-captions" hidden>
         <h1>Captions</h1>
         <p class="lede">Every style below is drawn with the same font file ffmpeg burns in, so the
@@ -2400,6 +2493,7 @@ const S = {
   mode: "multi", lenMin: 20, lenMax: 40, count: 15, autoCount: true,
   partLen: 30, seriesTitle: "", partLabel: true,
   podStyle: "both", hostColor: "", guestColor: "",
+  ranges: [],                 // manual mode: the clips the user marked
   burn: true, layout: "single", lang: "hindi", pos: "bottom",
   style: "outline", accent: "#66BB6A", capColor: "", words: 0,
   capSize: 1.0, posHi: "", posEn: "",
@@ -2425,6 +2519,10 @@ const STEPS = [
                                                   ? `Parts of ${S.partLen}s`
                                                   : `${MODE_NAME[S.mode]}, ${S.lenMin}–${S.lenMax}s`)
                                                  + ` · ${S.aspect}` },
+  { id: "manual",   t: "Mark clips",    only: () => S.mode === "manual",
+                                        v: () => S.ranges.length
+                                                   ? `${S.ranges.length} marked`
+                                                   : "none marked yet" },
   { id: "captions", t: "Captions",      v: () => !S.burn ? "Off — clean clips"
                                                   : `${LANG_NAME[S.lang]}, ${styleLabel(S.style)}`
                                                     + (S.words > 0 ? `, ${S.words}w` : "") },
@@ -2434,7 +2532,8 @@ const STEPS = [
                                                   .filter(Boolean).join(" + ") || "Clips only" },
 ];
 const MODE_NAME = { multi: "Many clips", best: "Best only", hook: "Hook first",
-                    podcast: "Podcast", sequential: "Sequential" };
+                    podcast: "Podcast", sequential: "Sequential",
+                    manual: "Marked by hand" };
 const LANG_NAME = { hindi: "हिन्दी", english: "English", hinglish: "Hinglish" };
 const PART_LENS = [15, 20, 30, 45, 60, 90, 120, 180, 300];
 const CLIP_LENS = [7, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 75, 90];
@@ -2465,10 +2564,14 @@ const secLabel = (s) => s >= 60
   : `${s}s`;
 
 /* ═════ Rail + section switching ════════════════════════════════════════════ */
+/* Steps currently in play. "Mark clips" only exists in manual mode, so the rail
+   and the Back/Next arithmetic both have to work off this, not off STEPS. */
+function steps() { return STEPS.filter((s) => !s.only || s.only()); }
+
 function buildRail() {
   const rail = $("rail");
   rail.textContent = "";
-  STEPS.forEach((s, i) => {
+  steps().forEach((s, i) => {
     const b = el("button", "step");
     b.type = "button";
     b.dataset.i = String(i);
@@ -2484,12 +2587,17 @@ function buildRail() {
   });
 }
 function goto(i) {
-  S.step = clamp(i, 0, STEPS.length - 1);
-  STEPS.forEach((s, k) => { $("sec-" + s.id).hidden = k !== S.step; });
+  const list = steps();
+  S.step = clamp(i, 0, list.length - 1);
+  // Hide EVERY section first, or a step that just left the list stays on screen.
+  STEPS.forEach((s) => { const n = $("sec-" + s.id); if (n) n.hidden = true; });
+  const cur = list[S.step];
+  if (cur) $("sec-" + cur.id).hidden = false;
+  if (cur && cur.id === "manual") { edLoadSource(); edRenderList(); edPaint(); }
   $("backBtn").disabled = S.step === 0;
-  $("nextBtn").hidden = S.step === STEPS.length - 1;
+  $("nextBtn").hidden = S.step === list.length - 1;
   buildRail();
-  if (S.step === STEPS.length - 1) renderSummary();
+  if (S.step === list.length - 1) renderSummary();
   document.querySelector(".stage").scrollIntoView({ block: "start", behavior: "smooth" });
 }
 $("backBtn").addEventListener("click", () => goto(S.step - 1));
@@ -2705,12 +2813,17 @@ group("clipModes", (v) => {
    out of step with what the backend actually does. */
 function applyMode() {
   const seq = S.mode === "sequential", hook = S.mode === "hook";
-  const pod = S.mode === "podcast";
+  const pod = S.mode === "podcast", man = S.mode === "manual";
   $("seqOnly").hidden = !seq;
   $("podOnly").hidden = !pod;
   // Podcast builds its own candidates from speaker turns, so the highlight-mode
   // length and count controls do not apply to it.
-  $("selOnly").hidden = seq || pod;
+  // Marking by hand replaces every AI-selection control: length, count, brief and
+  // the model all describe a decision the user is now making themselves.
+  $("selOnly").hidden = seq || pod || man;
+  const ms = $("sec-manual");
+  if (ms && !man) ms.hidden = true;
+  if (man) { edLoadSource(); edRenderList(); }
   // Hook mode is defined as 40s-1:00; showing a length control the renderer
   // overrides would be a lie, so it is hidden and the reason is stated.
   $("lenOnly").hidden = hook;
@@ -2718,7 +2831,7 @@ function applyMode() {
   $("autoCntTxt").textContent = (S.mode === "best" || hook)
     ? "Decide for me (1 per 2 min)" : "Decide for me (1 per min)";
   // Sequential mode does no AI picking, so the model choice has nothing to drive.
-  $("modelField").hidden = seq;
+  $("modelField").hidden = seq || man;
   if (hook) {
     // The cold open is chosen from the whole transcript, which only Gemini reads
     // in one pass — so the mode pins it rather than leaving it to chance.
@@ -3463,11 +3576,16 @@ function sync() {
   $("logoSolider").disabled = S.logoOpacity >= .999;
 
   // Generate
-  const ready = S.src === "online" ? !!$("url").value.trim()
-                                  : (!!S.file || !!S.filePath);
+  let ready = S.src === "online" ? !!$("url").value.trim()
+                                 : (!!S.file || !!S.filePath);
+  // Manual mode has a second requirement: clips actually marked.
+  if (ready && S.mode === "manual" && S.ranges.length === 0) ready = false;
   $("genBtn").disabled = !ready || S.busy;
   $("genHint").textContent = S.busy ? "Working…"
-    : ready ? "" : (S.src === "online" ? "Paste a link to begin" : "Choose a video to begin");
+    : ready ? ""
+    : (S.mode === "manual" && (S.file || S.filePath || $("url").value.trim())
+         ? "Mark at least one clip first"
+         : (S.src === "online" ? "Paste a link to begin" : "Choose a video to begin"));
 
   buildRail();
   renderPreview();
@@ -3492,6 +3610,195 @@ function renderSummary() {
   n.appendChild(wrap);
 }
 
+/* ═════ Manual clip editor ══════════════════════════════════════════════════
+   Marking clips by hand. The source is streamed with HTTP Range from /source
+   (or read straight off the File object in a browser), so scrubbing a 2 GB video
+   is instant instead of waiting for a full download. */
+
+const ED = { dur: 0, inPt: null, outPt: null, url: "", objectUrl: "" };
+
+const fmtT = (t) => {
+  if (!isFinite(t) || t < 0) t = 0;
+  const m = Math.floor(t / 60), sec = t % 60;
+  return `${m}:${sec.toFixed(sec < 10 ? 2 : 1).padStart(sec < 10 ? 5 : 4, "0")}`;
+};
+const fmtShort = (t) => {
+  const m = Math.floor(t / 60), sec = Math.floor(t % 60);
+  return `${m}:${String(sec).padStart(2, "0")}`;
+};
+
+function edVideo() { return $("edVideo"); }
+
+/* Point the editor at whatever the user chose on step 1. */
+function edLoadSource() {
+  const v = edVideo();
+  if (!v) return;
+  let url = "";
+  if (S.filePath) {
+    url = "/source?path=" + encodeURIComponent(S.filePath);
+  } else if (S.file) {
+    // A local File needs no server round-trip at all.
+    if (ED.objectUrl) URL.revokeObjectURL(ED.objectUrl);
+    ED.objectUrl = URL.createObjectURL(S.file);
+    url = ED.objectUrl;
+  }
+  const has = !!url;
+  $("edEmpty").hidden = has;
+  $("edMain").hidden = !has;
+  if (!has || url === ED.url) return;
+  ED.url = url;
+  v.src = url;
+  v.load();
+}
+
+function edSetDur(d) {
+  ED.dur = d || 0;
+  $("edDur").textContent = fmtShort(ED.dur);
+  $("edTl").setAttribute("aria-valuemax", String(Math.round(ED.dur)));
+  edPaint();
+}
+
+function edSeek(t) {
+  const v = edVideo();
+  if (!v || !ED.dur) return;
+  v.currentTime = clamp(t, 0, ED.dur);
+}
+
+function edPaint() {
+  const v = edVideo();
+  const now = v ? v.currentTime || 0 : 0;
+  const pct = ED.dur ? (now / ED.dur) * 100 : 0;
+  $("edPlay").style.left = pct + "%";
+  $("edNow").textContent = fmtT(now);
+  $("edTl").setAttribute("aria-valuenow", String(Math.round(now)));
+
+  // The pending selection
+  const sel = $("edSel");
+  if (ED.inPt !== null && ED.dur) {
+    const a = ED.inPt, b = ED.outPt !== null ? ED.outPt : now;
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    sel.hidden = false;
+    sel.style.left = (lo / ED.dur) * 100 + "%";
+    sel.style.width = Math.max(0.4, ((hi - lo) / ED.dur) * 100) + "%";
+  } else {
+    sel.hidden = true;
+  }
+
+  // Everything already marked
+  const box = $("edRanges");
+  box.textContent = "";
+  if (ED.dur) {
+    S.ranges.forEach((r, i) => {
+      const el2 = el("i");
+      el2.style.left = (r.start / ED.dur) * 100 + "%";
+      el2.style.width = Math.max(0.4, ((r.end - r.start) / ED.dur) * 100) + "%";
+      el2.appendChild(el("b", null, String(i + 1)));
+      box.appendChild(el2);
+    });
+  }
+
+  const ready = ED.inPt !== null && ED.outPt !== null &&
+                Math.abs(ED.outPt - ED.inPt) >= 0.5;
+  $("edAdd").disabled = !ready;
+  $("edHint").textContent = ED.inPt === null
+    ? "Marked: nothing yet. Press I where the clip should start."
+    : (ED.outPt === null
+       ? `Start at ${fmtT(ED.inPt)} — now press O where it should end.`
+       : `${fmtT(Math.min(ED.inPt, ED.outPt))} → ${fmtT(Math.max(ED.inPt, ED.outPt))}  ` +
+         `(${(Math.abs(ED.outPt - ED.inPt)).toFixed(1)}s). Enter adds it.`);
+}
+
+function edAddClip() {
+  if (ED.inPt === null || ED.outPt === null) return;
+  const a = Math.min(ED.inPt, ED.outPt), b = Math.max(ED.inPt, ED.outPt);
+  if (b - a < 0.5) return;
+  S.ranges.push({ start: +a.toFixed(3), end: +b.toFixed(3), title: "" });
+  S.ranges.sort((x, y) => x.start - y.start);
+  ED.inPt = ED.outPt = null;
+  edRenderList();
+  edPaint();
+  sync();
+}
+
+function edRenderList() {
+  const box = $("edList");
+  box.textContent = "";
+  $("edCount").textContent = S.ranges.length
+    ? `${S.ranges.length} clip${S.ranges.length > 1 ? "s" : ""}`
+    : "none yet";
+  S.ranges.forEach((r, i) => {
+    const row = el("div", "ed-row");
+    row.append(el("span", "i", String(i + 1)));
+    const t = el("span", "t", `${fmtT(r.start)}–${fmtT(r.end)}`);
+    t.title = "Jump to this clip";
+    t.addEventListener("click", () => edSeek(r.start));
+    row.append(t);
+    const name = el("input");
+    name.type = "text";
+    name.placeholder = "Title for this clip (optional)";
+    name.value = r.title || "";
+    name.addEventListener("input", () => { r.title = name.value; });
+    row.append(name);
+    const x = el("button", "x");
+    x.type = "button";
+    x.innerHTML = icon("i-x", 14);
+    x.setAttribute("aria-label", `Remove clip ${i + 1}`);
+    x.addEventListener("click", () => {
+      S.ranges.splice(i, 1); edRenderList(); edPaint(); sync();
+    });
+    row.append(x);
+    box.appendChild(row);
+  });
+}
+
+function edWire() {
+  const v = edVideo(), tl = $("edTl");
+  if (!v || !tl) return;
+
+  v.addEventListener("loadedmetadata", () => edSetDur(v.duration));
+  v.addEventListener("timeupdate", edPaint);
+  v.addEventListener("play",  () => { $("edToggle").textContent = "❚❚"; });
+  v.addEventListener("pause", () => { $("edToggle").textContent = "▶"; });
+  v.addEventListener("error", () => {
+    $("edHint").textContent = "That video could not be opened for preview. "
+      + "It will still process normally.";
+  });
+
+  $("edToggle").addEventListener("click", () => (v.paused ? v.play() : v.pause()));
+  $("edIn").addEventListener("click",  () => { ED.inPt = v.currentTime; ED.outPt = null; edPaint(); });
+  $("edOut").addEventListener("click", () => { ED.outPt = v.currentTime; edPaint(); });
+  $("edAdd").addEventListener("click", edAddClip);
+
+  const seekFromEvent = (e) => {
+    const r = tl.getBoundingClientRect();
+    if (!r.width || !ED.dur) return;
+    edSeek(((e.clientX - r.left) / r.width) * ED.dur);
+  };
+  let dragging = false;
+  tl.addEventListener("pointerdown", (e) => {
+    dragging = true; tl.setPointerCapture(e.pointerId); seekFromEvent(e);
+  });
+  tl.addEventListener("pointermove", (e) => { if (dragging) seekFromEvent(e); });
+  tl.addEventListener("pointerup", (e) => {
+    dragging = false;
+    try { tl.releasePointerCapture(e.pointerId); } catch (_) {}
+  });
+
+  // Keys only while this section is open, so they cannot fight the rest of the UI.
+  document.addEventListener("keydown", (e) => {
+    if ($("sec-manual").hidden) return;
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea") return;
+    const step = e.shiftKey ? 1 : 1 / 30;      // a second, or roughly a frame
+    if (e.key === " ") { e.preventDefault(); v.paused ? v.play() : v.pause(); }
+    else if (e.key.toLowerCase() === "i") { ED.inPt = v.currentTime; ED.outPt = null; edPaint(); }
+    else if (e.key.toLowerCase() === "o") { ED.outPt = v.currentTime; edPaint(); }
+    else if (e.key === "Enter") { e.preventDefault(); edAddClip(); }
+    else if (e.key === "ArrowLeft")  { e.preventDefault(); edSeek(v.currentTime - step); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); edSeek(v.currentTime + step); }
+  });
+}
+
 /* ═════ Options payload — the backend contract ══════════════════════════════ */
 function getOptions() {
   return {
@@ -3504,6 +3811,7 @@ function getOptions() {
     chunk_len: S.partLen,
     series_title: $("seriesTitle").value.trim(),
     show_part_label: S.partLabel,
+    manual_ranges: S.mode === "manual" ? S.ranges : undefined,
     podcast_style: S.podStyle,
     host_color: S.hostColor,
     guest_color: S.guestColor,

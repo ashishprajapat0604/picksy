@@ -1871,6 +1871,14 @@ dialog::backdrop{
 .spk-lbl{font-size:var(--t-sm); color:var(--text-2); font-weight:600}
 @media (max-width:860px){ .spk-row{grid-template-columns:minmax(0,1fr); gap:5px} }
 
+/* ── The hidden attribute must actually hide ─────────────────────────────
+   `hidden` is only display:none from the UA stylesheet, so ANY author rule
+   that sets display beats it — .rv{display:flex} left the edit modal on
+   screen at load with its own Close button unable to dismiss it, because
+   setting .hidden had no visible effect. Guard it globally rather than
+   per-component: the same trap catches every future flex/grid element. */
+[hidden]{display:none !important}
+
 /* The preset row reads as a row of cards, not a stack. */
 .choices-row{display:grid; gap:8px; grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
 
@@ -4080,6 +4088,10 @@ function rvWire() {
   $("rvTrimReset").addEventListener("click", () => { RV.t0 = RV.t1 = 0; rvPaint(); });
   $("rvCropOn").addEventListener("change", (e) => { $("rvCrop").hidden = !e.target.checked; });
   $("rvClose").addEventListener("click", rvClose);
+  // Clicking the dark surround closes it, as a modal is expected to. Guarded on
+  // the target being the backdrop itself, or a drag that ends outside the box
+  // (releasing a crop handle past the edge) would dismiss the panel mid-edit.
+  $("rv").addEventListener("click", (e) => { if (e.target === $("rv")) rvClose(); });
   $("rvCancel").addEventListener("click", rvClose);
   $("rvSave").addEventListener("click", rvSave);
   document.addEventListener("keydown", (e) => {
